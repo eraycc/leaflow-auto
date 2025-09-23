@@ -18,8 +18,12 @@ Leaflow 自动签到控制面板是一个基于 Web 的管理界面，用于自�
 
 ## 快速开始
 ### 版本更新
-最新版本：`ghcr.io/stsix/leaflow-auto-beta:20250911094422`
-20250911094422更新内容：
+
+最新版本：`ghcr.io/stsix/leaflow-auto-beta:20250923010234`
+#### 20250923010234更新内容：
+新增可自定义TG API代理地址，以解决TG API连接失败问题，由[@showyourlucky](https://github.com/showyourlucky)提交该功能并合入。
+
+#### 20250911094422更新内容：
 1. 修复了MySQL连接和保活问题
 2. 修复MySQL可能出现的连接错误问题
 3. 改进签到逻辑，新增缓存策略，避免MySQL连接池耗尽
