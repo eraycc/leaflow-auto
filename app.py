@@ -388,6 +388,7 @@ class Database:
                     # 添加通知设置新字段
                     notification_fields = [
                         ("telegram_enabled", "BOOLEAN DEFAULT FALSE"),
+                        ("telegram_custom_host", "VARCHAR(255) DEFAULT 'https://api.telegram.org'" if self.db_type == 'mysql' else "TEXT DEFAULT 'https://api.telegram.org'"),
                         ("wechat_enabled", "BOOLEAN DEFAULT FALSE"),
                         ("wxpusher_enabled", "BOOLEAN DEFAULT FALSE"),
                         ("wxpusher_app_token", "VARCHAR(255) DEFAULT ''"),
@@ -452,6 +453,11 @@ class Database:
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                     ''')
+                    # 添加新字段
+                    try:
+                        cursor.execute("ALTER TABLE notification_settings ADD COLUMN telegram_custom_host VARCHAR(255) DEFAULT 'https://api.telegram.org'")
+                    except:
+                        pass
                 
                 # 初始化通知设置 - 修复这里
                 cursor.execute('SELECT COUNT(*) as cnt FROM notification_settings')
@@ -616,11 +622,13 @@ class NotificationService:
             
             # Send Telegram notification
             if settings.get('telegram_enabled') and settings.get('telegram_bot_token') and settings.get('telegram_user_id'):
+                custom_host = settings.get('telegram_custom_host', 'https://api.telegram.org')
                 NotificationService.send_telegram(
                     settings['telegram_bot_token'],
                     settings['telegram_user_id'],
                     title,
-                    content
+                    content,
+                    custom_host
                 )
             
             # Send WeChat Work notification
@@ -653,10 +661,21 @@ class NotificationService:
             logger.error(f"Notification error: {e}")
     
     @staticmethod
-    def send_telegram(token, chat_id, title, content):
-        """Send Telegram notification"""
+    def send_telegram(token, chat_id, title, content, custom_host=None):
+        """Send Telegram notification with configurable host"""
         try:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            # 使用自定义host或默认host
+            if custom_host:
+                # URL标准化处理
+                host = custom_host.strip()
+                if not host.startswith(('http://', 'https://')):
+                    host = 'https://' + host
+                # 移除尾部斜杠
+                host = host.rstrip('/')
+            else:
+                host = "https://api.telegram.org"
+
+            url = f"{host}/bot{token}/sendMessage"
             data = {
                 "chat_id": chat_id,
                 "text": f"📢 {title}\n\n{content}",
@@ -667,7 +686,7 @@ class NotificationService:
             result = response.json()
             
             if result.get("ok"):
-                logger.info("Telegram notification sent successfully")
+                logger.info(f"Telegram notification sent successfully via {host}")
             else:
                 logger.error(f"Telegram notification failed: {result.get('description')}")
         except Exception as e:
@@ -1501,11 +1520,16 @@ def get_notification_settings():
             
             # 确保字符串字段不为None
             string_fields = [
-                'telegram_bot_token', 'telegram_user_id', 'wechat_webhook_key',
-                'wxpusher_app_token', 'wxpusher_uid', 'dingtalk_access_token', 'dingtalk_secret'
+                'telegram_bot_token', 'telegram_user_id', 'telegram_custom_host',
+                'wechat_webhook_key', 'wxpusher_app_token', 'wxpusher_uid',
+                'dingtalk_access_token', 'dingtalk_secret'
             ]
             for field in string_fields:
                 settings[field] = settings.get(field, '') or ''
+
+            # 确保telegram_custom_host有默认值
+            if not settings.get('telegram_custom_host'):
+                settings['telegram_custom_host'] = 'https://api.telegram.org'
             
             logger.info(f"Loaded notification settings: {settings}")
             return jsonify(settings)
@@ -1516,6 +1540,7 @@ def get_notification_settings():
                 'telegram_enabled': False,
                 'telegram_bot_token': '',
                 'telegram_user_id': '',
+                'telegram_custom_host': 'https://api.telegram.org',
                 'wechat_enabled': False,
                 'wechat_webhook_key': '',
                 'wxpusher_enabled': False,
@@ -1543,6 +1568,15 @@ def update_notification_settings():
         telegram_enabled = 1 if data.get('telegram_enabled', False) else 0
         telegram_bot_token = data.get('telegram_bot_token', '') or ''
         telegram_user_id = data.get('telegram_user_id', '') or ''
+        telegram_custom_host = data.get('telegram_custom_host', 'https://api.telegram.org') or 'https://api.telegram.org'
+
+        # URL标准化处理
+        if telegram_custom_host and telegram_custom_host.strip():
+            telegram_custom_host = telegram_custom_host.strip()
+            if not telegram_custom_host.startswith(('http://', 'https://')):
+                telegram_custom_host = 'https://' + telegram_custom_host
+            telegram_custom_host = telegram_custom_host.rstrip('/')
+
         wechat_enabled = 1 if data.get('wechat_enabled', False) else 0
         wechat_webhook_key = data.get('wechat_webhook_key', '') or ''
         wxpusher_enabled = 1 if data.get('wxpusher_enabled', False) else 0
@@ -1557,28 +1591,28 @@ def update_notification_settings():
         if existing:
             db.execute('''
                 UPDATE notification_settings
-                SET enabled = ?, telegram_enabled = ?, telegram_bot_token = ?, telegram_user_id = ?, 
-                    wechat_enabled = ?, wechat_webhook_key = ?, wxpusher_enabled = ?, 
+                SET enabled = ?, telegram_enabled = ?, telegram_bot_token = ?, telegram_user_id = ?,
+                    telegram_custom_host = ?, wechat_enabled = ?, wechat_webhook_key = ?, wxpusher_enabled = ?,
                     wxpusher_app_token = ?, wxpusher_uid = ?, dingtalk_enabled = ?,
                     dingtalk_access_token = ?, dingtalk_secret = ?, updated_at = ?
                 WHERE id = 1
             ''', (
                 enabled, telegram_enabled, telegram_bot_token, telegram_user_id,
-                wechat_enabled, wechat_webhook_key, wxpusher_enabled,
+                telegram_custom_host, wechat_enabled, wechat_webhook_key, wxpusher_enabled,
                 wxpusher_app_token, wxpusher_uid, dingtalk_enabled,
                 dingtalk_access_token, dingtalk_secret, datetime.now()
             ))
             logger.info("Notification settings updated successfully")
         else:
             db.execute('''
-                INSERT INTO notification_settings 
-                (id, enabled, telegram_enabled, telegram_bot_token, telegram_user_id, 
-                 wechat_enabled, wechat_webhook_key, wxpusher_enabled, wxpusher_app_token, 
+                INSERT INTO notification_settings
+                (id, enabled, telegram_enabled, telegram_bot_token, telegram_user_id,
+                 telegram_custom_host, wechat_enabled, wechat_webhook_key, wxpusher_enabled, wxpusher_app_token,
                  wxpusher_uid, dingtalk_enabled, dingtalk_access_token, dingtalk_secret)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 enabled, telegram_enabled, telegram_bot_token, telegram_user_id,
-                wechat_enabled, wechat_webhook_key, wxpusher_enabled,
+                telegram_custom_host, wechat_enabled, wechat_webhook_key, wxpusher_enabled,
                 wxpusher_app_token, wxpusher_uid, dingtalk_enabled,
                 dingtalk_access_token, dingtalk_secret
             ))
@@ -2277,6 +2311,13 @@ HTML_TEMPLATE = '''
                         <label>User ID</label>
                         <input type="text" id="tgUserId" placeholder="接收通知的用户ID">
                     </div>
+                    <div class="form-group">
+                        <label>自定义 Host (可选)</label>
+                        <input type="text" id="tgCustomHost" placeholder="https://api.telegram.org (默认)">
+                        <small style="color: #666; font-size: 12px; display: block; margin-top: 4px;">
+                            支持代理服务器，留空使用默认。没有协议前缀会自动补全 https://
+                        </small>
+                    </div>
                 </div>
                 
                 <!-- 企业微信通知设置 -->
@@ -2667,6 +2708,7 @@ HTML_TEMPLATE = '''
                 document.getElementById('telegramEnabled').checked = settings.telegram_enabled === true || settings.telegram_enabled === 1;
                 document.getElementById('tgBotToken').value = settings.telegram_bot_token || '';
                 document.getElementById('tgUserId').value = settings.telegram_user_id || '';
+                document.getElementById('tgCustomHost').value = settings.telegram_custom_host || 'https://api.telegram.org';
                 
                 // 企业微信设置
                 document.getElementById('wechatEnabled').checked = settings.wechat_enabled === true || settings.wechat_enabled === 1;
@@ -2785,6 +2827,7 @@ HTML_TEMPLATE = '''
                     telegram_enabled: document.getElementById('telegramEnabled').checked,
                     telegram_bot_token: document.getElementById('tgBotToken').value,
                     telegram_user_id: document.getElementById('tgUserId').value,
+                    telegram_custom_host: document.getElementById('tgCustomHost').value.trim(),
                     wechat_enabled: document.getElementById('wechatEnabled').checked,
                     wechat_webhook_key: document.getElementById('wechatKey').value,
                     wxpusher_enabled: document.getElementById('wxpusherEnabled').checked,
