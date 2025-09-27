@@ -17,7 +17,7 @@ import re
 import requests
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from flask import Flask, request, jsonify, render_template_string, make_response, redirect
+from flask import Flask, request, jsonify, render_template_string, make_response
 from flask_cors import CORS
 import jwt
 import logging
@@ -28,7 +28,6 @@ import hmac
 import base64
 import urllib.parse
 import traceback
-import pickle
 
 # Configuration
 app = Flask(__name__)
@@ -39,7 +38,7 @@ CORS(app, supports_credentials=True)
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
 PORT = int(os.getenv('PORT', '8181'))
-MAX_RETRY_ATTEMPTS = int(os.getenv('MAX_RETRY_ATTEMPTS', '12'))
+MAX_MYSQL_RETRIES = int(os.getenv('MAX_MYSQL_RETRIES', '12'))
 
 # 设置时区为北京时间
 TIMEZONE = pytz.timezone('Asia/Shanghai')
@@ -105,226 +104,284 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 本地数据缓存
-class LocalDataCache:
+# 账户缓存
+class AccountCache:
     def __init__(self):
-        self.cache_file = '/app/data/cache.pkl'
-        self.data = {
-            'accounts': [],
-            'notification_settings': None,
-            'checkin_history': [],
-            'last_sync': None
-        }
+        self.cache = {}
+        self.last_update = None
+        self.cache_duration = 300  # 5分钟缓存
         self.lock = threading.Lock()
-        self.load_cache()
     
-    def load_cache(self):
-        """从文件加载缓存"""
+    def get_accounts(self, force_refresh=False):
+        """获取缓存的账户列表"""
+        with self.lock:
+            now = time.time()
+            if force_refresh or not self.last_update or (now - self.last_update) > self.cache_duration:
+                return None
+            return list(self.cache.values())  # 返回列表而不是字典
+    
+    def update_cache(self, accounts):
+        """更新缓存"""
+        with self.lock:
+            self.cache = {acc['id']: acc for acc in accounts}
+            self.last_update = time.time()
+    
+    def invalidate(self):
+        """使缓存失效"""
+        with self.lock:
+            self.cache = {}
+            self.last_update = None
+    
+    def refresh_from_db(self, db):
+        """从数据库刷新缓存"""
         try:
-            if os.path.exists(self.cache_file):
-                with open(self.cache_file, 'rb') as f:
-                    self.data = pickle.load(f)
-                logger.info(f"Loaded cache from file, last sync: {self.data.get('last_sync')}")
+            accounts_list = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
+            if accounts_list:
+                self.update_cache(accounts_list)
+                logger.info(f"Account cache refreshed with {len(accounts_list)} accounts")
+            else:
+                self.invalidate()
         except Exception as e:
-            logger.error(f"Error loading cache: {e}")
-    
-    def save_cache(self):
-        """保存缓存到文件"""
-        try:
-            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
-            with open(self.cache_file, 'wb') as f:
-                pickle.dump(self.data, f)
-        except Exception as e:
-            logger.error(f"Error saving cache: {e}")
-    
-    def get_accounts(self):
-        """获取账户列表"""
-        with self.lock:
-            return self.data.get('accounts', [])
-    
-    def set_accounts(self, accounts):
-        """设置账户列表"""
-        with self.lock:
-            self.data['accounts'] = accounts
-            self.data['last_sync'] = datetime.now(TIMEZONE).isoformat()
-            self.save_cache()
-    
-    def get_notification_settings(self):
-        """获取通知设置"""
-        with self.lock:
-            return self.data.get('notification_settings')
-    
-    def set_notification_settings(self, settings):
-        """设置通知设置"""
-        with self.lock:
-            self.data['notification_settings'] = settings
-            self.save_cache()
-    
-    def add_checkin_history(self, record):
-        """添加签到历史"""
-        with self.lock:
-            if 'checkin_history' not in self.data:
-                self.data['checkin_history'] = []
-            self.data['checkin_history'].append(record)
-            # 只保留最近100条记录
-            self.data['checkin_history'] = self.data['checkin_history'][-100:]
-            self.save_cache()
-    
-    def clear(self):
-        """清空缓存"""
-        with self.lock:
-            self.data = {
-                'accounts': [],
-                'notification_settings': None,
-                'checkin_history': [],
-                'last_sync': None
-            }
-            self.save_cache()
+            logger.error(f"Error refreshing account cache: {e}")
 
-# 初始化本地缓存
-local_cache = LocalDataCache()
+account_cache = AccountCache()
+
+# 通用数据缓存类
+class DataCache:
+    def __init__(self, cache_duration=300):
+        self.cache = {}
+        self.cache_duration = cache_duration
+        self.lock = threading.Lock()
+    
+    def get(self, key):
+        """获取缓存数据"""
+        with self.lock:
+            if key in self.cache:
+                data, timestamp = self.cache[key]
+                if time.time() - timestamp < self.cache_duration:
+                    return data
+                else:
+                    del self.cache[key]
+            return None
+    
+    def set(self, key, data):
+        """设置缓存数据"""
+        with self.lock:
+            self.cache[key] = (data, time.time())
+    
+    def invalidate(self, key=None):
+        """使缓存失效"""
+        with self.lock:
+            if key:
+                self.cache.pop(key, None)
+            else:
+                self.cache.clear()
+    
+    def invalidate_pattern(self, pattern):
+        """使匹配模式的缓存失效"""
+        with self.lock:
+            keys_to_remove = [k for k in self.cache.keys() if pattern in k]
+            for key in keys_to_remove:
+                self.cache.pop(key, None)
+
+# 初始化数据缓存
+data_cache = DataCache(cache_duration=60)  # 1分钟缓存
 
 class Database:
     def __init__(self):
         self.lock = threading.Lock()
         self.conn = None
-        self.db_type = None
-        self.retry_count = 0
-        self.max_retries = MAX_RETRY_ATTEMPTS
-        self.retry_delays = [3, 6, 12, 24, 48, 96, 192, 384, 768, 1536, 3072, 6144]  # 递增的重试延迟
-        self.connect_with_retry()
+        self.pool = None
+        self.last_ping = time.time()
+        self.last_actual_ping = time.time()  # 记录上次实际ping的时间
+        self.ping_check_interval = 300  # 每5分钟检查一次
+        self.ping_actual_interval = 1800  # 30分钟实际ping间隔
+        self.db_type = None  # 初始化db_type
+        self.retry_count = 0  # 当前重试次数
+        self.max_retries = MAX_MYSQL_RETRIES  # 最大重试次数
+        self.connect()
         self.init_tables()
-        self.sync_from_db()  # 初始同步数据到缓存
+        # 启动保活线程
+        self.start_keepalive()
     
-    def get_retry_delay(self):
-        """获取当前重试延迟时间"""
-        if self.retry_count < len(self.retry_delays):
-            return self.retry_delays[self.retry_count]
-        return self.retry_delays[-1]
+    def start_keepalive(self):
+        """启动MySQL保活线程"""
+        if self.db_type == 'mysql':
+            thread = threading.Thread(target=self._keepalive_worker, daemon=True)
+            thread.start()
+            logger.info("MySQL intelligent keepalive thread started")
     
-    def connect_with_retry(self):
-        """带重试机制的连接"""
-        while self.retry_count < self.max_retries:
+    def _keepalive_worker(self):
+        """智能保活工作线程"""
+        while True:
             try:
-                self.connect()
-                self.retry_count = 0  # 连接成功，重置重试计数
-                return
-            except Exception as e:
-                self.retry_count += 1
-                delay = self.get_retry_delay()
-                logger.error(f"Database connection failed (attempt {self.retry_count}/{self.max_retries}): {e}")
+                time.sleep(self.ping_check_interval)  # 每5分钟检查一次
                 
-                if self.retry_count < self.max_retries:
-                    logger.info(f"Retrying in {delay} seconds...")
+                with self.lock:
+                    if self.conn and self.db_type == 'mysql':
+                        current_time = time.time()
+                        # 只有在距离上次实际ping超过30分钟时才执行ping
+                        if current_time - self.last_actual_ping >= self.ping_actual_interval:
+                            try:
+                                self.conn.ping(reconnect=True)
+                                self.last_actual_ping = current_time
+                                logger.debug(f"MySQL keepalive ping executed (30min interval)")
+                            except Exception as e:
+                                logger.error(f"MySQL ping failed, reconnecting: {e}")
+                                self.reconnect_with_retry()
+                                self.last_actual_ping = current_time
+                        else:
+                            remaining = self.ping_actual_interval - (current_time - self.last_actual_ping)
+                            logger.debug(f"Keepalive check: Next ping in {remaining:.0f} seconds")
+                            
+            except Exception as e:
+                logger.error(f"Keepalive worker error: {e}")
+    
+    def _ensure_connection(self):
+        """确保连接可用（智能ping）"""
+        if self.db_type == 'mysql':
+            current_time = time.time()
+            # 如果距离上次ping超过30分钟，执行ping
+            if current_time - self.last_actual_ping >= self.ping_actual_interval:
+                try:
+                    self.conn.ping(reconnect=True)
+                    self.last_actual_ping = current_time
+                    logger.debug("Connection ping on query execution")
+                except Exception as e:
+                    logger.error(f"Connection ping failed: {e}")
+                    self.reconnect_with_retry()
+                    self.last_actual_ping = current_time
+    
+    def calculate_retry_delay(self, attempt):
+        """计算重试延迟（指数退避）"""
+        base_delay = 3
+        max_delay = 24
+        delay = min(base_delay * (2 ** attempt), max_delay)
+        return delay
+    
+    def reconnect_with_retry(self):
+        """使用指数退避策略重新连接MySQL"""
+        if self.db_type != 'mysql':
+            self.reconnect()
+            return
+        
+        for attempt in range(self.max_retries):
+            try:
+                logger.info(f"MySQL reconnection attempt {attempt + 1}/{self.max_retries}")
+                
+                if self.conn:
+                    try:
+                        self.conn.close()
+                    except:
+                        pass
+                
+                import pymysql
+                self.conn = pymysql.connect(
+                    host=DB_HOST,
+                    port=DB_PORT,
+                    user=DB_USER,
+                    password=DB_PASSWORD,
+                    database=DB_NAME,
+                    charset='utf8mb4',
+                    autocommit=True,
+                    connect_timeout=10,
+                    read_timeout=30,
+                    write_timeout=30,
+                    max_allowed_packet=64*1024*1024  # 64MB
+                )
+                
+                self.last_actual_ping = time.time()
+                self.retry_count = 0  # 重置重试计数
+                
+                # 清空所有缓存
+                data_cache.invalidate()
+                account_cache.invalidate()
+                
+                logger.info("MySQL reconnected successfully, cache cleared")
+                return
+                
+            except Exception as e:
+                logger.error(f"MySQL reconnection attempt {attempt + 1} failed: {e}")
+                
+                if attempt < self.max_retries - 1:
+                    delay = self.calculate_retry_delay(attempt)
+                    logger.info(f"Waiting {delay} seconds before next retry...")
                     time.sleep(delay)
                 else:
-                    logger.error("Max retry attempts reached, falling back to SQLite")
-                    self.fallback_to_sqlite()
-                    return
+                    logger.error(f"All {self.max_retries} MySQL reconnection attempts failed")
+                    raise
     
-    def fallback_to_sqlite(self):
-        """回退到SQLite"""
+    def reconnect(self):
+        """重新连接数据库（兼容旧代码）"""
         try:
-            logger.info("Falling back to SQLite database")
-            os.makedirs('/app/data', exist_ok=True)
-            self.conn = sqlite3.connect('/app/data/leaflow_checkin.db', check_same_thread=False)
-            self.conn.row_factory = sqlite3.Row
-            self.db_type = 'sqlite'
-            logger.info("Successfully connected to SQLite database")
+            if self.db_type == 'mysql':
+                self.reconnect_with_retry()
+            else:
+                if self.conn:
+                    try:
+                        self.conn.close()
+                    except:
+                        pass
+                self.connect()
+                # 清空所有缓存
+                data_cache.invalidate()
+                account_cache.invalidate()
+                logger.info("Database reconnected successfully, cache cleared")
         except Exception as e:
-            logger.error(f"Failed to connect to SQLite: {e}")
+            logger.error(f"Database reconnection failed: {e}")
             raise
     
     def connect(self):
-        """Establish database connection"""
+        """Establish database connection with retry mechanism"""
         if DB_TYPE == 'mysql':
+            # MySQL使用新的重试机制
             import pymysql
-            logger.info(f"Connecting to MySQL: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER}")
-            self.conn = pymysql.connect(
-                host=DB_HOST,
-                port=DB_PORT,
-                user=DB_USER,
-                password=DB_PASSWORD,
-                database=DB_NAME,
-                charset='utf8mb4',
-                autocommit=True,
-                connect_timeout=10,
-                read_timeout=30,
-                write_timeout=30,
-                max_allowed_packet=64*1024*1024
-            )
-            self.db_type = 'mysql'
-            logger.info("Successfully connected to MySQL database")
+            
+            for attempt in range(self.max_retries):
+                try:
+                    logger.info(f"Connecting to MySQL: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER} (attempt {attempt + 1}/{self.max_retries})")
+                    self.conn = pymysql.connect(
+                        host=DB_HOST,
+                        port=DB_PORT,
+                        user=DB_USER,
+                        password=DB_PASSWORD,
+                        database=DB_NAME,
+                        charset='utf8mb4',
+                        autocommit=True,
+                        connect_timeout=10,
+                        read_timeout=30,
+                        write_timeout=30,
+                        max_allowed_packet=64*1024*1024  # 64MB
+                    )
+                    self.db_type = 'mysql'
+                    self.last_actual_ping = time.time()
+                    self.retry_count = 0
+                    logger.info("Successfully connected to MySQL database")
+                    return
+                    
+                except Exception as e:
+                    logger.error(f"MySQL connection attempt {attempt + 1} failed: {e}")
+                    
+                    if attempt < self.max_retries - 1:
+                        delay = self.calculate_retry_delay(attempt)
+                        logger.info(f"Waiting {delay} seconds before next retry...")
+                        time.sleep(delay)
+                    else:
+                        logger.error("All MySQL connection attempts failed, falling back to SQLite")
+                        # Fallback to SQLite
+                        os.makedirs('/app/data', exist_ok=True)
+                        self.conn = sqlite3.connect('/app/data/leaflow_checkin.db', check_same_thread=False)
+                        self.conn.row_factory = sqlite3.Row
+                        self.db_type = 'sqlite'
+                        logger.info("Successfully connected to SQLite database (fallback)")
         else:
+            # SQLite连接
             logger.info("Using SQLite database")
             os.makedirs('/app/data', exist_ok=True)
             self.conn = sqlite3.connect('/app/data/leaflow_checkin.db', check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
             self.db_type = 'sqlite'
             logger.info("Successfully connected to SQLite database")
-    
-    def reconnect(self):
-        """重新连接数据库"""
-        try:
-            if self.conn:
-                try:
-                    self.conn.close()
-                except:
-                    pass
-            self.connect_with_retry()
-            self.sync_from_db()  # 重连后同步数据
-            logger.info("Database reconnected and synced successfully")
-        except Exception as e:
-            logger.error(f"Database reconnection failed: {e}")
-    
-    def sync_from_db(self):
-        """从数据库同步数据到本地缓存"""
-        try:
-            # 同步账户数据
-            accounts = self.fetchall('SELECT * FROM accounts', use_cache=False)
-            if accounts:
-                local_cache.set_accounts(accounts)
-            
-            # 同步通知设置
-            settings = self.fetchone('SELECT * FROM notification_settings WHERE id = 1', use_cache=False)
-            if settings:
-                local_cache.set_notification_settings(settings)
-            
-            logger.info(f"Synced {len(accounts) if accounts else 0} accounts and notification settings from database")
-        except Exception as e:
-            logger.error(f"Error syncing from database: {e}")
-    
-    def sync_to_db(self, table, data, operation='update'):
-        """同步数据到数据库"""
-        try:
-            with self.lock:
-                if operation == 'insert':
-                    # 插入操作
-                    if table == 'accounts':
-                        self.execute('''
-                            INSERT INTO accounts (name, token_data, checkin_time_start, checkin_time_end, check_interval, retry_count)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        ''', data, use_cache=False)
-                elif operation == 'update':
-                    # 更新操作
-                    if table == 'accounts':
-                        self.execute('''
-                            UPDATE accounts SET token_data = ?, enabled = ?, checkin_time_start = ?, 
-                            checkin_time_end = ?, check_interval = ?, retry_count = ?
-                            WHERE id = ?
-                        ''', data, use_cache=False)
-                elif operation == 'delete':
-                    # 删除操作
-                    if table == 'accounts':
-                        self.execute('DELETE FROM accounts WHERE id = ?', data, use_cache=False)
-                
-                # 操作成功后重新同步
-                self.sync_from_db()
-        except Exception as e:
-            logger.error(f"Error syncing to database: {e}")
-            # 如果是MySQL连接问题，尝试重连
-            if self.db_type == 'mysql' and 'Lost connection' in str(e):
-                self.reconnect()
     
     def init_tables(self):
         """Initialize database tables"""
@@ -392,15 +449,23 @@ class Database:
                     new_fields = [
                         ("accounts", "retry_count", "INT DEFAULT 2"),
                         ("checkin_history", "retry_times", "INT DEFAULT 0"),
+                        ("notification_settings", "telegram_enabled", "BOOLEAN DEFAULT FALSE"),
                         ("notification_settings", "telegram_host", "VARCHAR(255) DEFAULT ''"),
+                        ("notification_settings", "wechat_enabled", "BOOLEAN DEFAULT FALSE"),
                         ("notification_settings", "wechat_host", "VARCHAR(255) DEFAULT ''"),
+                        ("notification_settings", "wxpusher_enabled", "BOOLEAN DEFAULT FALSE"),
+                        ("notification_settings", "wxpusher_app_token", "VARCHAR(255) DEFAULT ''"),
+                        ("notification_settings", "wxpusher_uid", "VARCHAR(255) DEFAULT ''"),
                         ("notification_settings", "wxpusher_host", "VARCHAR(255) DEFAULT ''"),
+                        ("notification_settings", "dingtalk_enabled", "BOOLEAN DEFAULT FALSE"),
+                        ("notification_settings", "dingtalk_access_token", "VARCHAR(255) DEFAULT ''"),
+                        ("notification_settings", "dingtalk_secret", "VARCHAR(255) DEFAULT ''"),
                         ("notification_settings", "dingtalk_host", "VARCHAR(255) DEFAULT ''")
                     ]
                     
-                    for table, field_name, field_type in new_fields:
+                    for table_name, field_name, field_type in new_fields:
                         try:
-                            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {field_name} {field_type}")
+                            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {field_name} {field_type}")
                         except:
                             pass
                     
@@ -487,26 +552,24 @@ class Database:
                 logger.error(traceback.format_exc())
                 raise
     
-    def execute(self, query, params=None, use_cache=True):
-        """Execute a database query"""
-        # 对于查询操作，优先使用缓存
-        if use_cache and query.strip().upper().startswith('SELECT'):
-            if 'accounts' in query and 'WHERE enabled = 1' in query:
-                # 返回缓存的账户数据
-                accounts = local_cache.get_accounts()
-                if accounts:
-                    return [acc for acc in accounts if acc.get('enabled')]
-            elif 'notification_settings' in query:
-                # 返回缓存的通知设置
-                settings = local_cache.get_notification_settings()
-                if settings:
-                    return settings
+    def execute(self, query, params=None, use_cache=False, cache_key=None):
+        """Execute a database query with connection retry and optional caching"""
+        # 尝试从缓存获取数据（仅用于SELECT查询）
+        if use_cache and cache_key and query.strip().upper().startswith('SELECT'):
+            cached_data = data_cache.get(cache_key)
+            if cached_data is not None:
+                logger.debug(f"Cache hit for key: {cache_key}")
+                return cached_data
         
-        # 执行数据库操作
         with self.lock:
-            max_retries = 3
+            max_retries = self.max_retries if self.db_type == 'mysql' else 3
+            
             for attempt in range(max_retries):
                 try:
+                    if self.db_type == 'mysql':
+                        # 智能检查连接
+                        self._ensure_connection()
+                    
                     cursor = self.conn.cursor()
                     
                     if self.db_type == 'mysql' and query:
@@ -520,33 +583,43 @@ class Database:
                     if self.db_type == 'sqlite':
                         self.conn.commit()
                     
-                    # 如果是修改操作，同步到缓存
-                    if not query.strip().upper().startswith('SELECT'):
-                        self.sync_from_db()
+                    # 如果需要缓存且是SELECT查询，缓存结果
+                    if use_cache and cache_key and query.strip().upper().startswith('SELECT'):
+                        data_cache.set(cache_key, cursor)
+                    
+                    # 成功执行，重置重试计数
+                    if self.db_type == 'mysql':
+                        self.retry_count = 0
                     
                     return cursor
                     
                 except Exception as e:
                     logger.error(f"Database execute error (attempt {attempt + 1}): {e}")
-                    if 'Lost connection' in str(e) or '2013' in str(e):
-                        if attempt < max_retries - 1:
-                            self.reconnect()
-                            time.sleep(1)
-                        else:
-                            raise
-                    else:
+                    
+                    if self.db_type == 'mysql' and attempt < max_retries - 1:
+                        delay = self.calculate_retry_delay(attempt)
+                        logger.info(f"Retrying database operation in {delay} seconds...")
+                        time.sleep(delay)
+                        
+                        # 尝试重新连接
+                        try:
+                            self.reconnect_with_retry()
+                        except:
+                            pass
+                    elif attempt == max_retries - 1:
                         raise
     
-    def fetchone(self, query, params=None, use_cache=True):
-        """Fetch one row from database"""
-        # 优先从缓存获取
+    def fetchone(self, query, params=None, use_cache=False):
+        """Fetch one row from database with optional caching"""
+        cache_key = None
         if use_cache:
-            if 'notification_settings' in query:
-                settings = local_cache.get_notification_settings()
-                if settings:
-                    return settings
+            # 生成缓存键
+            cache_key = f"fetchone_{hash(query)}_{hash(str(params))}"
+            cached_data = data_cache.get(cache_key)
+            if cached_data is not None:
+                return cached_data
         
-        cursor = self.execute(query, params, use_cache=False)
+        cursor = self.execute(query, params)
         result = cursor.fetchone()
         
         if result:
@@ -558,20 +631,23 @@ class Database:
             elif self.db_type == 'sqlite':
                 result = dict(result) if result else None
         
+        # 缓存结果
+        if use_cache and cache_key:
+            data_cache.set(cache_key, result)
+        
         return result
     
-    def fetchall(self, query, params=None, use_cache=True):
-        """Fetch all rows from database"""
-        # 优先从缓存获取
+    def fetchall(self, query, params=None, use_cache=False):
+        """Fetch all rows from database with optional caching"""
+        cache_key = None
         if use_cache:
-            if 'accounts' in query:
-                accounts = local_cache.get_accounts()
-                if accounts:
-                    if 'WHERE enabled = 1' in query:
-                        return [acc for acc in accounts if acc.get('enabled')]
-                    return accounts
+            # 生成缓存键
+            cache_key = f"fetchall_{hash(query)}_{hash(str(params))}"
+            cached_data = data_cache.get(cache_key)
+            if cached_data is not None:
+                return cached_data
         
-        cursor = self.execute(query, params, use_cache=False)
+        cursor = self.execute(query, params)
         results = cursor.fetchall()
         
         if results:
@@ -582,7 +658,21 @@ class Database:
             elif self.db_type == 'sqlite':
                 results = [dict(row) for row in results]
         
-        return results or []
+        results = results or []
+        
+        # 缓存结果
+        if use_cache and cache_key:
+            data_cache.set(cache_key, results)
+        
+        return results
+    
+    def __del__(self):
+        """清理连接"""
+        try:
+            if self.conn:
+                self.conn.close()
+        except:
+            pass
 
 # Initialize database
 try:
@@ -597,8 +687,8 @@ class NotificationService:
     def send_notification(title, content, account_name=None):
         """Send notification through configured channels"""
         try:
-            # 从缓存获取设置
-            settings = local_cache.get_notification_settings()
+            # 不使用缓存，直接从数据库获取最新设置
+            settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
             if not settings or not settings.get('enabled'):
                 logger.info("Notifications disabled")
                 return
@@ -649,8 +739,8 @@ class NotificationService:
     def send_telegram(token, chat_id, title, content, custom_host=''):
         """Send Telegram notification"""
         try:
-            host = custom_host.strip() if custom_host else "https://api.telegram.org"
-            url = f"{host}/bot{token}/sendMessage"
+            base_url = custom_host.rstrip('/') if custom_host else "https://api.telegram.org"
+            url = f"{base_url}/bot{token}/sendMessage"
             data = {
                 "chat_id": chat_id,
                 "text": f"📢 {title}\n\n{content}",
@@ -671,8 +761,8 @@ class NotificationService:
     def send_wechat(webhook_key, title, content, custom_host=''):
         """Send WeChat Work notification"""
         try:
-            host = custom_host.strip() if custom_host else "https://qyapi.weixin.qq.com"
-            url = f"{host}/cgi-bin/webhook/send?key={webhook_key}"
+            base_url = custom_host.rstrip('/') if custom_host else "https://qyapi.weixin.qq.com"
+            url = f"{base_url}/cgi-bin/webhook/send?key={webhook_key}"
             headers = {"Content-Type": "application/json;charset=utf-8"}
             data = {"msgtype": "text", "text": {"content": f"【{title}】\n\n{content}"}}
             
@@ -694,10 +784,10 @@ class NotificationService:
     def send_wxpusher(app_token, uid, title, content, custom_host=''):
         """Send WxPusher notification"""
         try:
-            host = custom_host.strip() if custom_host else "https://wxpusher.zjiecode.com"
-            url = f"{host}/api/send/message"
+            base_url = custom_host.rstrip('/') if custom_host else "https://wxpusher.zjiecode.com"
+            url = f"{base_url}/api/send/message"
             
-            # 格式化HTML内容 - 修复深色模式问题
+            # 修复HTML模板，使其在深色模式下也能正常显示
             html_content = f"""
             <div style="padding: 10px; color: #2c3e50; background: #ffffff;">
                 <h2 style="color: inherit; margin: 0;">{title}</h2>
@@ -713,8 +803,8 @@ class NotificationService:
             data = {
                 "appToken": app_token,
                 "content": html_content,
-                "summary": title[:20],
-                "contentType": 2,
+                "summary": title[:20],  # 摘要限制20字符
+                "contentType": 2,  # HTML格式
                 "uids": [uid],
                 "verifyPayType": 0
             }
@@ -744,8 +834,8 @@ class NotificationService:
             sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
             
             # 构建URL
-            host = custom_host.strip() if custom_host else "https://oapi.dingtalk.com"
-            url = f'{host}/robot/send?access_token={access_token}&timestamp={timestamp}&sign={sign}'
+            base_url = custom_host.rstrip('/') if custom_host else "https://oapi.dingtalk.com"
+            url = f'{base_url}/robot/send?access_token={access_token}&timestamp={timestamp}&sign={sign}'
             
             # 构建消息体
             data = {
@@ -769,7 +859,7 @@ class NotificationService:
         except Exception as e:
             logger.error(f"DingTalk notification error: {e}")
 
-# Leaflow check-in class (保持不变)
+# Leaflow check-in class
 class LeafLowCheckin:
     def __init__(self):
         self.checkin_url = "https://checkin.leaflow.net"
@@ -997,9 +1087,6 @@ def token_required(f):
         token = request.headers.get('Authorization')
         
         if not token:
-            token = request.cookies.get('auth_token')
-        
-        if not token:
             return jsonify({'message': 'Token is missing!'}), 401
         
         try:
@@ -1023,7 +1110,7 @@ class CheckinScheduler:
         self.scheduler_thread = None
         self.running = False
         self.leaflow_checkin = LeafLowCheckin()
-        self.checkin_tasks = {}
+        self.checkin_tasks = {}  # 存储每个账户的签到任务
     
     def start(self):
         if not self.running:
@@ -1046,18 +1133,19 @@ class CheckinScheduler:
                 now = datetime.now(TIMEZONE)
                 current_date = now.date()
                 
-                # 从缓存获取账户
-                accounts = local_cache.get_accounts()
-                if not accounts:
-                    # 缓存为空，从数据库同步
-                    db.sync_from_db()
-                    accounts = local_cache.get_accounts()
+                # 尝试从缓存获取账户
+                accounts = account_cache.get_accounts()
+                if accounts is None:
+                    # 缓存失效，从数据库获取
+                    accounts_list = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
+                    if accounts_list:
+                        account_cache.update_cache(accounts_list)
+                        accounts = accounts_list  # 直接使用列表
+                    else:
+                        accounts = []
                 
                 for account in accounts:
                     try:
-                        if not account.get('enabled'):
-                            continue
-                        
                         account_id = account['id']
                         
                         # 检查今天是否已经签到
@@ -1066,7 +1154,7 @@ class CheckinScheduler:
                             if isinstance(last_checkin_date, str):
                                 last_checkin_date = datetime.strptime(last_checkin_date, '%Y-%m-%d').date()
                             if last_checkin_date == current_date:
-                                continue
+                                continue  # 今天已经签到，跳过
                         
                         # 获取签到时间范围
                         start_time_str = account.get('checkin_time_start', '06:30')
@@ -1123,7 +1211,7 @@ class CheckinScheduler:
                 logger.error(traceback.format_exc())
             
             # 等待一段时间再检查
-            time.sleep(30)
+            time.sleep(30)  # 每30秒检查一次
     
     def perform_checkin_with_delay(self, account_id, task_key):
         """带随机延迟的签到执行"""
@@ -1146,14 +1234,7 @@ class CheckinScheduler:
     def perform_checkin(self, account_id, retry_attempt=0):
         """Perform check-in for an account with retry mechanism"""
         try:
-            # 从缓存获取账户信息
-            accounts = local_cache.get_accounts()
-            account = None
-            for acc in accounts:
-                if acc['id'] == account_id:
-                    account = acc
-                    break
-            
+            account = db.fetchone('SELECT * FROM accounts WHERE id = ?', (account_id,))
             if not account or not account.get('enabled'):
                 return False
             
@@ -1164,7 +1245,7 @@ class CheckinScheduler:
             existing_checkin = db.fetchone('''
                 SELECT id FROM checkin_history 
                 WHERE account_id = ? AND checkin_date = ?
-            ''', (account_id, current_date), use_cache=False)
+            ''', (account_id, current_date))
             
             if existing_checkin:
                 logger.info(f"Account {account['name']} already checked in today")
@@ -1189,33 +1270,23 @@ class CheckinScheduler:
             retry_count = account.get('retry_count', 2)
             if not success and retry_attempt < retry_count:
                 logger.info(f"Retrying checkin for {account['name']} (attempt {retry_attempt + 1}/{retry_count})")
-                time.sleep(5)
+                time.sleep(5)  # 等待5秒后重试
                 return self.perform_checkin(account_id, retry_attempt + 1)
             
             # Record check-in result
             db.execute('''
                 INSERT INTO checkin_history (account_id, success, message, checkin_date, retry_times)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (account_id, success, message, current_date, retry_attempt), use_cache=False)
+            ''', (account_id, success, message, current_date, retry_attempt))
             
             # 更新最后签到日期
             if success:
                 db.execute('''
                     UPDATE accounts SET last_checkin_date = ?
                     WHERE id = ?
-                ''', (current_date, account_id), use_cache=False)
-                # 同步缓存
-                db.sync_from_db()
-            
-            # 添加到本地缓存历史
-            local_cache.add_checkin_history({
-                'account_id': account_id,
-                'account_name': account['name'],
-                'success': success,
-                'message': message,
-                'retry_times': retry_attempt,
-                'created_at': datetime.now(TIMEZONE).isoformat()
-            })
+                ''', (current_date, account_id))
+                # 刷新账户缓存
+                account_cache.refresh_from_db(db)
             
             logger.info(f"Check-in for {account['name']}: {'Success' if success else 'Failed'} - {message}")
             
@@ -1233,12 +1304,7 @@ class CheckinScheduler:
             
             # Send error notification
             try:
-                accounts = local_cache.get_accounts()
-                account = None
-                for acc in accounts:
-                    if acc['id'] == account_id:
-                        account = acc
-                        break
+                account = db.fetchone('SELECT name FROM accounts WHERE id = ?', (account_id,))
                 if account:
                     NotificationService.send_notification(
                         f"Leaflow签到错误 - {account['name']}",
@@ -1255,15 +1321,8 @@ scheduler = CheckinScheduler()
 # Routes
 @app.route('/')
 def index():
-    """Serve the main HTML page or redirect to dashboard"""
-    token = request.cookies.get('auth_token')
-    if token:
-        try:
-            jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            return render_template_string(HTML_TEMPLATE, authenticated=True)
-        except:
-            pass
-    return render_template_string(HTML_TEMPLATE, authenticated=False)
+    """Serve the main HTML page"""
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/api/login', methods=['POST', 'OPTIONS'])
 def login():
@@ -1292,10 +1351,7 @@ def login():
             }, app.config['SECRET_KEY'], algorithm='HS256')
             
             logger.info(f"Login successful for user: {username}")
-            
-            response = jsonify({'token': token, 'message': 'Login successful'})
-            response.set_cookie('auth_token', token, max_age=7*24*60*60, httponly=True)
-            return response
+            return jsonify({'token': token, 'message': 'Login successful'})
         
         logger.warning(f"Login failed for user: {username}")
         return jsonify({'message': 'Invalid credentials'}), 401
@@ -1304,27 +1360,25 @@ def login():
         logger.error(f"Login error: {e}")
         return jsonify({'message': 'Login error'}), 500
 
-@app.route('/api/logout', methods=['POST'])
-def logout():
-    """Handle logout"""
-    response = jsonify({'message': 'Logged out successfully'})
-    response.set_cookie('auth_token', '', expires=0)
-    return response
+@app.route('/api/verify', methods=['GET'])
+@token_required
+def verify_token():
+    """Verify if token is valid"""
+    return jsonify({'valid': True})
 
 @app.route('/api/dashboard', methods=['GET'])
 @token_required
 def dashboard():
     """Get dashboard statistics"""
     try:
-        # 从缓存获取账户数据
-        accounts = local_cache.get_accounts()
-        total_accounts = len(accounts)
-        enabled_accounts = len([acc for acc in accounts if acc.get('enabled')])
+        # 使用缓存获取统计数据
+        total_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts', use_cache=True)
+        enabled_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts WHERE enabled = 1', use_cache=True)
         
         # 获取今天的日期（北京时间）
         today = datetime.now(TIMEZONE).date()
         
-        # 获取今日签到记录
+        # 获取今日签到记录（不使用缓存，保证实时性）
         today_checkins = db.fetchall('''
             SELECT a.name, ch.success, ch.message, ch.created_at, ch.retry_times
             FROM checkin_history ch
@@ -1332,18 +1386,18 @@ def dashboard():
             WHERE DATE(ch.checkin_date) = DATE(?)
             ORDER BY ch.created_at DESC
             LIMIT 20
-        ''', (today,), use_cache=False)
+        ''', (today,))
         
-        total_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history', use_cache=False)
-        successful_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history WHERE success = 1', use_cache=False)
+        total_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history', use_cache=True)
+        successful_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history WHERE success = 1', use_cache=True)
         
         total_count = total_checkins['count'] if total_checkins else 0
         success_count = successful_checkins['count'] if successful_checkins else 0
         success_rate = round(success_count / total_count * 100, 2) if total_count > 0 else 0
         
         return jsonify({
-            'total_accounts': total_accounts,
-            'enabled_accounts': enabled_accounts,
+            'total_accounts': total_accounts['count'] if total_accounts else 0,
+            'enabled_accounts': enabled_accounts['count'] if enabled_accounts else 0,
             'today_checkins': today_checkins or [],
             'total_checkins': total_count,
             'successful_checkins': success_count,
@@ -1359,23 +1413,12 @@ def dashboard():
 def get_accounts():
     """Get all accounts"""
     try:
-        # 从缓存获取账户
-        accounts = local_cache.get_accounts()
-        # 过滤敏感信息
-        safe_accounts = []
-        for acc in accounts:
-            safe_acc = {
-                'id': acc['id'],
-                'name': acc['name'],
-                'enabled': acc.get('enabled', True),
-                'checkin_time_start': acc.get('checkin_time_start', '06:30'),
-                'checkin_time_end': acc.get('checkin_time_end', '06:40'),
-                'check_interval': acc.get('check_interval', 60),
-                'retry_count': acc.get('retry_count', 2),
-                'created_at': acc.get('created_at')
-            }
-            safe_accounts.append(safe_acc)
-        return jsonify(safe_accounts)
+        accounts = db.fetchall('''
+            SELECT id, name, enabled, checkin_time_start, checkin_time_end, 
+                   check_interval, retry_count, created_at 
+            FROM accounts
+        ''')
+        return jsonify(accounts or [])
     except Exception as e:
         logger.error(f"Get accounts error: {e}")
         return jsonify({'error': 'Failed to load accounts'}), 500
@@ -1402,16 +1445,17 @@ def add_account():
         else:
             token_data = cookie_input
         
-        # 添加到数据库
         db.execute('''
             INSERT INTO accounts (name, token_data, checkin_time_start, checkin_time_end, check_interval, retry_count)
             VALUES (?, ?, ?, ?, ?, ?)
-        ''', (name, json.dumps(token_data), checkin_time_start, checkin_time_end, check_interval, retry_count), use_cache=False)
+        ''', (name, json.dumps(token_data), checkin_time_start, checkin_time_end, check_interval, retry_count))
         
-        # 同步缓存
-        db.sync_from_db()
+        # 立即刷新账户缓存
+        account_cache.refresh_from_db(db)
+        # 清除相关数据缓存
+        data_cache.invalidate()
         
-        logger.info(f"Account '{name}' added and cache synced")
+        logger.info(f"Account '{name}' added and cache refreshed")
         
         return jsonify({'message': 'Account added successfully'})
         
@@ -1463,12 +1507,14 @@ def update_account(account_id):
         if updates:
             params.append(account_id)
             query = f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?"
-            db.execute(query, params, use_cache=False)
+            db.execute(query, params)
             
-            # 同步缓存
-            db.sync_from_db()
+            # 立即刷新账户缓存
+            account_cache.refresh_from_db(db)
+            # 清除相关数据缓存
+            data_cache.invalidate()
             
-            logger.info(f"Account {account_id} updated and cache synced")
+            logger.info(f"Account {account_id} updated and cache refreshed")
             
             return jsonify({'message': 'Account updated successfully'})
         
@@ -1483,13 +1529,15 @@ def update_account(account_id):
 def delete_account(account_id):
     """Delete an account"""
     try:
-        db.execute('DELETE FROM checkin_history WHERE account_id = ?', (account_id,), use_cache=False)
-        db.execute('DELETE FROM accounts WHERE id = ?', (account_id,), use_cache=False)
+        db.execute('DELETE FROM checkin_history WHERE account_id = ?', (account_id,))
+        db.execute('DELETE FROM accounts WHERE id = ?', (account_id,))
         
-        # 同步缓存
-        db.sync_from_db()
+        # 立即刷新账户缓存
+        account_cache.refresh_from_db(db)
+        # 清除相关数据缓存
+        data_cache.invalidate()
         
-        logger.info(f"Account {account_id} deleted and cache synced")
+        logger.info(f"Account {account_id} deleted and cache refreshed")
         
         return jsonify({'message': 'Account deleted successfully'})
     except Exception as e:
@@ -1507,22 +1555,24 @@ def clear_checkin_history():
         if clear_type == 'today':
             # 清空今日签到记录
             today = datetime.now(TIMEZONE).date()
-            db.execute('DELETE FROM checkin_history WHERE DATE(checkin_date) = DATE(?)', (today,), use_cache=False)
+            db.execute('DELETE FROM checkin_history WHERE DATE(checkin_date) = DATE(?)', (today,))
             # 重置今日的最后签到日期
-            db.execute('UPDATE accounts SET last_checkin_date = NULL WHERE DATE(last_checkin_date) = DATE(?)', (today,), use_cache=False)
+            db.execute('UPDATE accounts SET last_checkin_date = NULL WHERE DATE(last_checkin_date) = DATE(?)', (today,))
             message = 'Today\'s checkin history cleared'
         elif clear_type == 'all':
             # 清空所有签到记录
-            db.execute('DELETE FROM checkin_history', use_cache=False)
-            db.execute('UPDATE accounts SET last_checkin_date = NULL', use_cache=False)
+            db.execute('DELETE FROM checkin_history')
+            db.execute('UPDATE accounts SET last_checkin_date = NULL')
             message = 'All checkin history cleared'
         else:
             return jsonify({'message': 'Invalid clear type'}), 400
         
-        # 同步缓存
-        db.sync_from_db()
+        # 立即刷新账户缓存
+        account_cache.refresh_from_db(db)
+        # 清除相关数据缓存
+        data_cache.invalidate()
         
-        logger.info(f"Checkin history cleared ({clear_type}) and cache synced")
+        logger.info(f"Checkin history cleared ({clear_type}) and cache refreshed")
         
         return jsonify({'message': message})
     except Exception as e:
@@ -1534,8 +1584,8 @@ def clear_checkin_history():
 def get_notification_settings():
     """Get notification settings"""
     try:
-        # 从缓存获取通知设置
-        settings = local_cache.get_notification_settings()
+        # 直接从数据库获取最新设置，不使用缓存
+        settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
         if settings:
             # 转换布尔值
             for key in ['enabled', 'telegram_enabled', 'wechat_enabled', 'wxpusher_enabled', 'dingtalk_enabled']:
@@ -1552,6 +1602,7 @@ def get_notification_settings():
             for field in string_fields:
                 settings[field] = settings.get(field, '') or ''
             
+            logger.info(f"Loaded notification settings: {settings}")
             return jsonify(settings)
         else:
             default_settings = {
@@ -1604,7 +1655,7 @@ def update_notification_settings():
         dingtalk_secret = data.get('dingtalk_secret', '') or ''
         dingtalk_host = data.get('dingtalk_host', '') or ''
         
-        existing = db.fetchone('SELECT id FROM notification_settings WHERE id = 1', use_cache=False)
+        existing = db.fetchone('SELECT id FROM notification_settings WHERE id = 1')
         
         if existing:
             db.execute('''
@@ -1621,7 +1672,7 @@ def update_notification_settings():
                 wxpusher_enabled, wxpusher_app_token, wxpusher_uid, wxpusher_host,
                 dingtalk_enabled, dingtalk_access_token, dingtalk_secret, dingtalk_host,
                 datetime.now()
-            ), use_cache=False)
+            ))
             logger.info("Notification settings updated successfully")
         else:
             db.execute('''
@@ -1636,11 +1687,15 @@ def update_notification_settings():
                 wechat_enabled, wechat_webhook_key, wechat_host,
                 wxpusher_enabled, wxpusher_app_token, wxpusher_uid, wxpusher_host,
                 dingtalk_enabled, dingtalk_access_token, dingtalk_secret, dingtalk_host
-            ), use_cache=False)
+            ))
             logger.info("Notification settings created successfully")
         
-        # 同步缓存
-        db.sync_from_db()
+        # 清除所有通知相关缓存
+        data_cache.invalidate_pattern('notification')
+        
+        # 立即从数据库获取最新设置并验证
+        updated_settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
+        logger.info(f"Verified settings after update: {updated_settings}")
         
         return jsonify({'message': 'Notification settings updated successfully'})
     except Exception as e:
@@ -1673,7 +1728,7 @@ def test_notification():
         logger.error(f"Test notification error: {e}")
         return jsonify({'message': f'Error: {str(e)}'}), 400
 
-# HTML Template (修改后的版本，修复登录界面问题并添加自定义API地址输入框)
+# HTML Template (续)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -2193,7 +2248,7 @@ HTML_TEMPLATE = '''
     <div id="toast" class="toast"></div>
 
     <!-- Login Container -->
-    <div class="login-container" id="loginContainer" style="display: {{ 'none' if authenticated else 'flex' }};">
+    <div class="login-container" id="loginContainer">
         <div class="login-box">
             <h2>🔐 管理员登录</h2>
             <div id="loginForm">
@@ -2212,7 +2267,7 @@ HTML_TEMPLATE = '''
     </div>
 
     <!-- Dashboard -->
-    <div class="dashboard" id="dashboard" style="display: {{ 'block' if authenticated else 'none' }};">
+    <div class="dashboard" id="dashboard">
         <div class="container">
             <div class="header">
                 <div class="header-content">
@@ -2329,7 +2384,7 @@ HTML_TEMPLATE = '''
                         <input type="text" id="tgUserId" placeholder="接收通知的用户ID">
                     </div>
                     <div class="form-group">
-                        <label>自定义API地址（可选）</label>
+                        <label>API地址（可选）</label>
                         <input type="text" id="telegramHost" placeholder="https://api.telegram.org">
                         <div class="format-hint">留空使用默认地址</div>
                     </div>
@@ -2347,7 +2402,7 @@ HTML_TEMPLATE = '''
                         <input type="text" id="wechatKey" placeholder="企业微信机器人的 Webhook Key">
                     </div>
                     <div class="form-group">
-                        <label>自定义API地址（可选）</label>
+                        <label>API地址（可选）</label>
                         <input type="text" id="wechatHost" placeholder="https://qyapi.weixin.qq.com">
                         <div class="format-hint">留空使用默认地址</div>
                     </div>
@@ -2374,7 +2429,7 @@ HTML_TEMPLATE = '''
                         <input type="text" id="wxpusherUid" placeholder="UID_xxx">
                     </div>
                     <div class="form-group">
-                        <label>自定义API地址（可选）</label>
+                        <label>API地址（可选）</label>
                         <input type="text" id="wxpusherHost" placeholder="https://wxpusher.zjiecode.com">
                         <div class="format-hint">留空使用默认地址</div>
                     </div>
@@ -2401,7 +2456,7 @@ HTML_TEMPLATE = '''
                         <input type="text" id="dingtalkSecret" placeholder="安全设置中的加签密钥">
                     </div>
                     <div class="form-group">
-                        <label>自定义API地址（可选）</label>
+                        <label>API地址（可选）</label>
                         <input type="text" id="dingtalkHost" placeholder="https://oapi.dingtalk.com">
                         <div class="format-hint">留空使用默认地址</div>
                     </div>
@@ -2486,7 +2541,7 @@ HTML_TEMPLATE = '''
 
     <script>
         // 全局变量
-        let authToken = null;
+        let authToken = localStorage.getItem('authToken');
         
         // Toast notification function
         function showToast(message, type = 'info') {
@@ -2537,6 +2592,7 @@ HTML_TEMPLATE = '''
                 
                 if (response.ok && data.token) {
                     authToken = data.token;
+                    localStorage.setItem('authToken', authToken);
                     showToast('登录成功', 'success');
                     
                     document.getElementById('loginContainer').style.display = 'none';
@@ -2559,51 +2615,69 @@ HTML_TEMPLATE = '''
 
         // 监听回车键
         document.addEventListener('DOMContentLoaded', function() {
-            // 如果已经认证，直接加载数据
-            {% if authenticated %}
-            loadDashboard();
-            loadAccounts();
-            loadNotificationSettings();
-            {% endif %}
-            
-            document.getElementById('username')?.addEventListener('keypress', function(e) {
+            document.getElementById('username').addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
                     handleLogin();
                 }
             });
             
-            document.getElementById('password')?.addEventListener('keypress', function(e) {
+            document.getElementById('password').addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
                     handleLogin();
                 }
             });
+            
+            // 检查是否已登录
+            if (authToken) {
+                // 验证token是否有效
+                fetch('/api/verify', {
+                    headers: {
+                        'Authorization': 'Bearer ' + authToken
+                    }
+                }).then(response => {
+                    if (response.ok) {
+                        // Token有效，直接显示控制面板
+                        document.getElementById('loginContainer').style.display = 'none';
+                        document.getElementById('dashboard').style.display = 'block';
+                        loadDashboard();
+                        loadAccounts();
+                        loadNotificationSettings();
+                    } else {
+                        // Token无效，清除并显示登录页面
+                        localStorage.removeItem('authToken');
+                        authToken = null;
+                        document.getElementById('loginContainer').style.display = 'flex';
+                        document.getElementById('dashboard').style.display = 'none';
+                    }
+                }).catch(error => {
+                    console.error('Token check error:', error);
+                    localStorage.removeItem('authToken');
+                    authToken = null;
+                    document.getElementById('loginContainer').style.display = 'flex';
+                    document.getElementById('dashboard').style.display = 'none';
+                });
+            } else {
+                // 没有token，显示登录页面
+                document.getElementById('loginContainer').style.display = 'flex';
+                document.getElementById('dashboard').style.display = 'none';
+            }
         });
 
         function logout() {
-            fetch('/api/logout', {
-                method: 'POST',
-                credentials: 'include'
-            }).then(() => {
-                authToken = null;
-                location.reload();
-            });
+            localStorage.removeItem('authToken');
+            authToken = null;
+            location.reload();
         }
 
         async function apiCall(url, options = {}) {
             try {
-                const headers = {
-                    'Content-Type': 'application/json',
-                    ...options.headers
-                };
-                
-                if (authToken) {
-                    headers['Authorization'] = 'Bearer ' + authToken;
-                }
-                
                 const response = await fetch(url, {
                     ...options,
-                    headers,
-                    credentials: 'include'
+                    headers: {
+                        'Authorization': 'Bearer ' + authToken,
+                        'Content-Type': 'application/json',
+                        ...options.headers
+                    }
                 });
 
                 if (response.status === 401) {
@@ -2823,7 +2897,6 @@ HTML_TEMPLATE = '''
                     await apiCall(`/api/accounts/${id}`, { method: 'DELETE' });
                     showToast('账号删除成功', 'success');
                     loadAccounts();
-                    loadDashboard();
                 } catch (error) {
                     showToast('操作失败', 'error');
                 }
@@ -2907,7 +2980,7 @@ HTML_TEMPLATE = '''
                 document.getElementById('checkInterval').value = '60';
                 document.getElementById('retryCount').value = '2';
                 document.getElementById('tokenData').value = '';
-            } else if (modalId === 'editAccountModal') {
+            } else if (modalId === 'editAccountModal') {  
                 document.getElementById('editAccountId').value = '';
                 document.getElementById('editTokenData').value = '';
             }
@@ -2937,7 +3010,6 @@ HTML_TEMPLATE = '''
                 showToast('账号添加成功', 'success');
                 closeModal('addAccountModal');
                 loadAccounts();
-                loadDashboard();
             } catch (error) {
                 showToast('格式无效: ' + error.message, 'error');
             }
@@ -2976,6 +3048,13 @@ HTML_TEMPLATE = '''
                 }
             });
         }
+
+        // 定期刷新dashboard数据
+        setInterval(() => {
+            if (authToken && document.getElementById('dashboard').style.display === 'block') {
+                loadDashboard();
+            }
+        }, 60000); // 每分钟刷新一次
     </script>
 </body>
 </html>
@@ -2988,14 +3067,15 @@ if __name__ == '__main__':
         
         # Log startup information
         logger.info(f"Starting Leaflow Control Panel on port {PORT}")
-        logger.info(f"Database type: {DB_TYPE if db else 'Unknown'}")
+        logger.info(f"Database type: {DB_TYPE}")
         if DB_TYPE == 'mysql':
             logger.info(f"MySQL connection: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER}")
-            logger.info(f"Max retry attempts: {MAX_RETRY_ATTEMPTS}")
+            logger.info(f"MySQL retry strategy: Exponential backoff with max {MAX_MYSQL_RETRIES} retries")
         logger.info(f"Admin username: {ADMIN_USERNAME}")
         logger.info(f"Access the panel at: http://localhost:{PORT}")
         logger.info(f"Timezone: Asia/Shanghai (UTC+8)")
-        logger.info(f"Local cache enabled for better performance")
+        logger.info(f"MySQL keepalive strategy: Check every 5 minutes, ping every 30 minutes")
+        logger.info(f"Data caching enabled: Account cache refreshes on data changes")
         
         # Start Flask app
         app.run(host='0.0.0.0', port=PORT, debug=False)
