@@ -28,7 +28,7 @@ import hmac
 import base64
 import urllib.parse
 import traceback
-from contextlib import contextmanager
+import pickle
 
 # Configuration
 app = Flask(__name__)
@@ -43,16 +43,6 @@ MAX_RETRY_ATTEMPTS = int(os.getenv('MAX_RETRY_ATTEMPTS', '12'))
 
 # 设置时区为北京时间
 TIMEZONE = pytz.timezone('Asia/Shanghai')
-
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
 
 # Database configuration
 def parse_mysql_dsn(dsn):
@@ -105,125 +95,152 @@ else:
     DB_USER = 'root'
     DB_PASSWORD = ''
 
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# 本地数据缓存
+class LocalDataCache:
+    def __init__(self):
+        self.cache_file = '/app/data/cache.pkl'
+        self.data = {
+            'accounts': [],
+            'notification_settings': None,
+            'checkin_history': [],
+            'last_sync': None
+        }
+        self.lock = threading.Lock()
+        self.load_cache()
+    
+    def load_cache(self):
+        """从文件加载缓存"""
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'rb') as f:
+                    self.data = pickle.load(f)
+                logger.info(f"Loaded cache from file, last sync: {self.data.get('last_sync')}")
+        except Exception as e:
+            logger.error(f"Error loading cache: {e}")
+    
+    def save_cache(self):
+        """保存缓存到文件"""
+        try:
+            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(self.data, f)
+        except Exception as e:
+            logger.error(f"Error saving cache: {e}")
+    
+    def get_accounts(self):
+        """获取账户列表"""
+        with self.lock:
+            return self.data.get('accounts', [])
+    
+    def set_accounts(self, accounts):
+        """设置账户列表"""
+        with self.lock:
+            self.data['accounts'] = accounts
+            self.data['last_sync'] = datetime.now(TIMEZONE).isoformat()
+            self.save_cache()
+    
+    def get_notification_settings(self):
+        """获取通知设置"""
+        with self.lock:
+            return self.data.get('notification_settings')
+    
+    def set_notification_settings(self, settings):
+        """设置通知设置"""
+        with self.lock:
+            self.data['notification_settings'] = settings
+            self.save_cache()
+    
+    def add_checkin_history(self, record):
+        """添加签到历史"""
+        with self.lock:
+            if 'checkin_history' not in self.data:
+                self.data['checkin_history'] = []
+            self.data['checkin_history'].append(record)
+            # 只保留最近100条记录
+            self.data['checkin_history'] = self.data['checkin_history'][-100:]
+            self.save_cache()
+    
+    def clear(self):
+        """清空缓存"""
+        with self.lock:
+            self.data = {
+                'accounts': [],
+                'notification_settings': None,
+                'checkin_history': [],
+                'last_sync': None
+            }
+            self.save_cache()
+
+# 初始化本地缓存
+local_cache = LocalDataCache()
+
 class Database:
     def __init__(self):
         self.lock = threading.Lock()
-        self.mysql_pool = None
-        self.local_db_path = '/app/data/leaflow_cache.db'
+        self.conn = None
+        self.db_type = None
         self.retry_count = 0
         self.max_retries = MAX_RETRY_ATTEMPTS
-        self.base_retry_delay = 3  # 基础重试延迟（秒）
-        self.using_mysql = False
-        
-        # 确保数据目录存在
-        os.makedirs('/app/data', exist_ok=True)
-        
-        # 初始化本地SQLite缓存
-        self.init_local_cache()
-        
-        # 尝试连接MySQL
-        if DB_TYPE == 'mysql':
-            self.connect_mysql()
-        else:
-            logger.info("Using SQLite as primary database")
-            self.using_mysql = False
+        self.retry_delays = [3, 6, 12, 24, 48, 96, 192, 384, 768, 1536, 3072, 6144]  # 递增的重试延迟
+        self.connect_with_retry()
+        self.init_tables()
+        self.sync_from_db()  # 初始同步数据到缓存
     
-    def init_local_cache(self):
-        """初始化本地SQLite缓存数据库"""
+    def get_retry_delay(self):
+        """获取当前重试延迟时间"""
+        if self.retry_count < len(self.retry_delays):
+            return self.retry_delays[self.retry_count]
+        return self.retry_delays[-1]
+    
+    def connect_with_retry(self):
+        """带重试机制的连接"""
+        while self.retry_count < self.max_retries:
+            try:
+                self.connect()
+                self.retry_count = 0  # 连接成功，重置重试计数
+                return
+            except Exception as e:
+                self.retry_count += 1
+                delay = self.get_retry_delay()
+                logger.error(f"Database connection failed (attempt {self.retry_count}/{self.max_retries}): {e}")
+                
+                if self.retry_count < self.max_retries:
+                    logger.info(f"Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    logger.error("Max retry attempts reached, falling back to SQLite")
+                    self.fallback_to_sqlite()
+                    return
+    
+    def fallback_to_sqlite(self):
+        """回退到SQLite"""
         try:
-            conn = sqlite3.connect(self.local_db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            
-            # 创建表结构
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS accounts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name VARCHAR(255) UNIQUE NOT NULL,
-                    token_data TEXT NOT NULL,
-                    enabled BOOLEAN DEFAULT 1,
-                    checkin_time_start VARCHAR(5) DEFAULT '06:30',
-                    checkin_time_end VARCHAR(5) DEFAULT '06:40',
-                    check_interval INTEGER DEFAULT 60,
-                    retry_count INTEGER DEFAULT 2,
-                    last_checkin_date DATE DEFAULT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS checkin_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id INTEGER NOT NULL,
-                    success BOOLEAN NOT NULL,
-                    message TEXT,
-                    checkin_date DATE NOT NULL,
-                    retry_times INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS notification_settings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    enabled BOOLEAN DEFAULT 0,
-                    telegram_enabled BOOLEAN DEFAULT 0,
-                    telegram_bot_token TEXT DEFAULT '',
-                    telegram_user_id TEXT DEFAULT '',
-                    telegram_custom_host TEXT DEFAULT 'https://api.telegram.org',
-                    wechat_enabled BOOLEAN DEFAULT 0,
-                    wechat_webhook_key TEXT DEFAULT '',
-                    wxpusher_enabled BOOLEAN DEFAULT 0,
-                    wxpusher_app_token TEXT DEFAULT '',
-                    wxpusher_uid TEXT DEFAULT '',
-                    dingtalk_enabled BOOLEAN DEFAULT 0,
-                    dingtalk_access_token TEXT DEFAULT '',
-                    dingtalk_secret TEXT DEFAULT '',
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # 初始化通知设置
-            cursor.execute('SELECT COUNT(*) as cnt FROM notification_settings')
-            count = cursor.fetchone()['cnt']
-            if count == 0:
-                cursor.execute('''
-                    INSERT INTO notification_settings (enabled) VALUES (0)
-                ''')
-            
-            conn.commit()
-            conn.close()
-            
-            logger.info("Local SQLite cache initialized successfully")
-            
+            logger.info("Falling back to SQLite database")
+            os.makedirs('/app/data', exist_ok=True)
+            self.conn = sqlite3.connect('/app/data/leaflow_checkin.db', check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self.db_type = 'sqlite'
+            logger.info("Successfully connected to SQLite database")
         except Exception as e:
-            logger.error(f"Error initializing local cache: {e}")
+            logger.error(f"Failed to connect to SQLite: {e}")
             raise
     
-    def connect_mysql(self):
-        """连接MySQL数据库，使用指数退避重试机制"""
-        if DB_TYPE != 'mysql':
-            return False
-        
-        try:
+    def connect(self):
+        """Establish database connection"""
+        if DB_TYPE == 'mysql':
             import pymysql
-            from pymysql import pooling
-            
-            # 计算重试延迟（指数退避）
-            if self.retry_count > 0:
-                delay = min(self.base_retry_delay * (2 ** (self.retry_count - 1)), 300)  # 最大5分钟
-                logger.info(f"Waiting {delay} seconds before retry attempt {self.retry_count}/{self.max_retries}")
-                time.sleep(delay)
-            
-            logger.info(f"Connecting to MySQL: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER} (attempt {self.retry_count + 1}/{self.max_retries})")
-            
-            # 创建连接池
-            self.mysql_pool = pooling.MySQLConnectionPool(
-                pool_name="leaflow_pool",
-                pool_size=5,
-                pool_reset_session=True,
+            logger.info(f"Connecting to MySQL: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER}")
+            self.conn = pymysql.connect(
                 host=DB_HOST,
                 port=DB_PORT,
                 user=DB_USER,
@@ -233,338 +250,339 @@ class Database:
                 autocommit=True,
                 connect_timeout=10,
                 read_timeout=30,
-                write_timeout=30
+                write_timeout=30,
+                max_allowed_packet=64*1024*1024
             )
-            
-            # 测试连接
-            with self.get_mysql_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
-            
+            self.db_type = 'mysql'
             logger.info("Successfully connected to MySQL database")
-            self.using_mysql = True
-            self.retry_count = 0  # 重置重试计数
-            
-            # 初始化MySQL表结构
-            self.init_mysql_tables()
-            
-            # 从MySQL同步数据到本地缓存
-            self.sync_from_mysql()
-            
-            return True
-            
+        else:
+            logger.info("Using SQLite database")
+            os.makedirs('/app/data', exist_ok=True)
+            self.conn = sqlite3.connect('/app/data/leaflow_checkin.db', check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self.db_type = 'sqlite'
+            logger.info("Successfully connected to SQLite database")
+    
+    def reconnect(self):
+        """重新连接数据库"""
+        try:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except:
+                    pass
+            self.connect_with_retry()
+            self.sync_from_db()  # 重连后同步数据
+            logger.info("Database reconnected and synced successfully")
         except Exception as e:
-            logger.error(f"MySQL connection failed: {e}")
-            self.retry_count += 1
-            
-            if self.retry_count < self.max_retries:
-                # 启动重连线程
-                threading.Thread(target=self._reconnect_mysql, daemon=True).start()
-            else:
-                logger.error(f"Max retry attempts ({self.max_retries}) reached. Falling back to SQLite cache.")
-                self.using_mysql = False
-            
-            return False
+            logger.error(f"Database reconnection failed: {e}")
     
-    def _reconnect_mysql(self):
-        """后台重连MySQL"""
-        while self.retry_count < self.max_retries and not self.using_mysql:
-            if self.connect_mysql():
-                break
-    
-    @contextmanager
-    def get_mysql_connection(self):
-        """获取MySQL连接的上下文管理器"""
-        if not self.mysql_pool:
-            raise Exception("MySQL pool not initialized")
-        
-        conn = self.mysql_pool.get_connection()
+    def sync_from_db(self):
+        """从数据库同步数据到本地缓存"""
         try:
-            yield conn
-        finally:
-            conn.close()
+            # 同步账户数据
+            accounts = self.fetchall('SELECT * FROM accounts', use_cache=False)
+            if accounts:
+                local_cache.set_accounts(accounts)
+            
+            # 同步通知设置
+            settings = self.fetchone('SELECT * FROM notification_settings WHERE id = 1', use_cache=False)
+            if settings:
+                local_cache.set_notification_settings(settings)
+            
+            logger.info(f"Synced {len(accounts) if accounts else 0} accounts and notification settings from database")
+        except Exception as e:
+            logger.error(f"Error syncing from database: {e}")
     
-    def init_mysql_tables(self):
-        """初始化MySQL表结构"""
+    def sync_to_db(self, table, data, operation='update'):
+        """同步数据到数据库"""
         try:
-            with self.get_mysql_connection() as conn:
-                cursor = conn.cursor()
+            with self.lock:
+                if operation == 'insert':
+                    # 插入操作
+                    if table == 'accounts':
+                        self.execute('''
+                            INSERT INTO accounts (name, token_data, checkin_time_start, checkin_time_end, check_interval, retry_count)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        ''', data, use_cache=False)
+                elif operation == 'update':
+                    # 更新操作
+                    if table == 'accounts':
+                        self.execute('''
+                            UPDATE accounts SET token_data = ?, enabled = ?, checkin_time_start = ?, 
+                            checkin_time_end = ?, check_interval = ?, retry_count = ?
+                            WHERE id = ?
+                        ''', data, use_cache=False)
+                elif operation == 'delete':
+                    # 删除操作
+                    if table == 'accounts':
+                        self.execute('DELETE FROM accounts WHERE id = ?', data, use_cache=False)
                 
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS accounts (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        name VARCHAR(255) UNIQUE NOT NULL,
-                        token_data TEXT NOT NULL,
-                        enabled BOOLEAN DEFAULT TRUE,
-                        checkin_time_start VARCHAR(5) DEFAULT '06:30',
-                        checkin_time_end VARCHAR(5) DEFAULT '06:40',
-                        check_interval INT DEFAULT 60,
-                        retry_count INT DEFAULT 2,
-                        last_checkin_date DATE DEFAULT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                    )
-                ''')
+                # 操作成功后重新同步
+                self.sync_from_db()
+        except Exception as e:
+            logger.error(f"Error syncing to database: {e}")
+            # 如果是MySQL连接问题，尝试重连
+            if self.db_type == 'mysql' and 'Lost connection' in str(e):
+                self.reconnect()
+    
+    def init_tables(self):
+        """Initialize database tables"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
                 
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS checkin_history (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        account_id INT NOT NULL,
-                        success BOOLEAN NOT NULL,
-                        message TEXT,
-                        checkin_date DATE NOT NULL,
-                        retry_times INT DEFAULT 0,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                        INDEX idx_checkin_date (checkin_date),
-                        INDEX idx_account_date (account_id, checkin_date)
-                    )
-                ''')
-                
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS notification_settings (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        enabled BOOLEAN DEFAULT FALSE,
-                        telegram_enabled BOOLEAN DEFAULT FALSE,
-                        telegram_bot_token VARCHAR(255) DEFAULT '',
-                        telegram_user_id VARCHAR(255) DEFAULT '',
-                        telegram_custom_host VARCHAR(255) DEFAULT 'https://api.telegram.org',
-                        wechat_enabled BOOLEAN DEFAULT FALSE,
-                        wechat_webhook_key VARCHAR(255) DEFAULT '',
-                        wxpusher_enabled BOOLEAN DEFAULT FALSE,
-                        wxpusher_app_token VARCHAR(255) DEFAULT '',
-                        wxpusher_uid VARCHAR(255) DEFAULT '',
-                        dingtalk_enabled BOOLEAN DEFAULT FALSE,
-                        dingtalk_access_token VARCHAR(255) DEFAULT '',
-                        dingtalk_secret VARCHAR(255) DEFAULT '',
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                    )
-                ''')
+                if self.db_type == 'mysql':
+                    # MySQL table creation
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS accounts (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            name VARCHAR(255) UNIQUE NOT NULL,
+                            token_data TEXT NOT NULL,
+                            enabled BOOLEAN DEFAULT TRUE,
+                            checkin_time_start VARCHAR(5) DEFAULT '06:30',
+                            checkin_time_end VARCHAR(5) DEFAULT '06:40',
+                            check_interval INT DEFAULT 60,
+                            retry_count INT DEFAULT 2,
+                            last_checkin_date DATE DEFAULT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS checkin_history (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            account_id INT NOT NULL,
+                            success BOOLEAN NOT NULL,
+                            message TEXT,
+                            checkin_date DATE NOT NULL,
+                            retry_times INT DEFAULT 0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                            INDEX idx_checkin_date (checkin_date),
+                            INDEX idx_account_date (account_id, checkin_date)
+                        )
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS notification_settings (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            enabled BOOLEAN DEFAULT FALSE,
+                            telegram_enabled BOOLEAN DEFAULT FALSE,
+                            telegram_bot_token VARCHAR(255) DEFAULT '',
+                            telegram_user_id VARCHAR(255) DEFAULT '',
+                            telegram_host VARCHAR(255) DEFAULT '',
+                            wechat_enabled BOOLEAN DEFAULT FALSE,
+                            wechat_webhook_key VARCHAR(255) DEFAULT '',
+                            wechat_host VARCHAR(255) DEFAULT '',
+                            wxpusher_enabled BOOLEAN DEFAULT FALSE,
+                            wxpusher_app_token VARCHAR(255) DEFAULT '',
+                            wxpusher_uid VARCHAR(255) DEFAULT '',
+                            wxpusher_host VARCHAR(255) DEFAULT '',
+                            dingtalk_enabled BOOLEAN DEFAULT FALSE,
+                            dingtalk_access_token VARCHAR(255) DEFAULT '',
+                            dingtalk_secret VARCHAR(255) DEFAULT '',
+                            dingtalk_host VARCHAR(255) DEFAULT '',
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    
+                    # 添加新字段（如果不存在）
+                    new_fields = [
+                        ("accounts", "retry_count", "INT DEFAULT 2"),
+                        ("checkin_history", "retry_times", "INT DEFAULT 0"),
+                        ("notification_settings", "telegram_host", "VARCHAR(255) DEFAULT ''"),
+                        ("notification_settings", "wechat_host", "VARCHAR(255) DEFAULT ''"),
+                        ("notification_settings", "wxpusher_host", "VARCHAR(255) DEFAULT ''"),
+                        ("notification_settings", "dingtalk_host", "VARCHAR(255) DEFAULT ''")
+                    ]
+                    
+                    for table, field_name, field_type in new_fields:
+                        try:
+                            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {field_name} {field_type}")
+                        except:
+                            pass
+                    
+                else:
+                    # SQLite table creation
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS accounts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name VARCHAR(255) UNIQUE NOT NULL,
+                            token_data TEXT NOT NULL,
+                            enabled BOOLEAN DEFAULT 1,
+                            checkin_time_start VARCHAR(5) DEFAULT '06:30',
+                            checkin_time_end VARCHAR(5) DEFAULT '06:40',
+                            check_interval INTEGER DEFAULT 60,
+                            retry_count INTEGER DEFAULT 2,
+                            last_checkin_date DATE DEFAULT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS checkin_history (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            account_id INTEGER NOT NULL,
+                            success BOOLEAN NOT NULL,
+                            message TEXT,
+                            checkin_date DATE NOT NULL,
+                            retry_times INTEGER DEFAULT 0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                        )
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS notification_settings (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            enabled BOOLEAN DEFAULT 0,
+                            telegram_enabled BOOLEAN DEFAULT 0,
+                            telegram_bot_token TEXT DEFAULT '',
+                            telegram_user_id TEXT DEFAULT '',
+                            telegram_host TEXT DEFAULT '',
+                            wechat_enabled BOOLEAN DEFAULT 0,
+                            wechat_webhook_key TEXT DEFAULT '',
+                            wechat_host TEXT DEFAULT '',
+                            wxpusher_enabled BOOLEAN DEFAULT 0,
+                            wxpusher_app_token TEXT DEFAULT '',
+                            wxpusher_uid TEXT DEFAULT '',
+                            wxpusher_host TEXT DEFAULT '',
+                            dingtalk_enabled BOOLEAN DEFAULT 0,
+                            dingtalk_access_token TEXT DEFAULT '',
+                            dingtalk_secret TEXT DEFAULT '',
+                            dingtalk_host TEXT DEFAULT '',
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    ''')
                 
                 # 初始化通知设置
                 cursor.execute('SELECT COUNT(*) as cnt FROM notification_settings')
-                count = cursor.fetchone()[0]
-                if count == 0:
-                    cursor.execute('INSERT INTO notification_settings (enabled) VALUES (FALSE)')
+                result = cursor.fetchone()
                 
-                logger.info("MySQL tables initialized successfully")
-                
-        except Exception as e:
-            logger.error(f"Error initializing MySQL tables: {e}")
-            raise
-    
-    def sync_from_mysql(self):
-        """从MySQL同步数据到本地缓存"""
-        if not self.using_mysql:
-            return
-        
-        try:
-            with self.get_mysql_connection() as mysql_conn:
-                mysql_cursor = mysql_conn.cursor()
-                
-                with sqlite3.connect(self.local_db_path) as sqlite_conn:
-                    sqlite_conn.row_factory = sqlite3.Row
-                    sqlite_cursor = sqlite_conn.cursor()
-                    
-                    # 同步accounts表
-                    mysql_cursor.execute("SELECT * FROM accounts")
-                    accounts = mysql_cursor.fetchall()
-                    
-                    if mysql_cursor.description:
-                        columns = [desc[0] for desc in mysql_cursor.description]
-                        
-                        # 清空本地accounts表
-                        sqlite_cursor.execute("DELETE FROM accounts")
-                        
-                        for account in accounts:
-                            account_dict = dict(zip(columns, account))
-                            # 插入到SQLite（忽略id，让SQLite自动生成）
-                            sqlite_cursor.execute('''
-                                INSERT INTO accounts (name, token_data, enabled, checkin_time_start, 
-                                                     checkin_time_end, check_interval, retry_count, 
-                                                     last_checkin_date, created_at, updated_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ''', (
-                                account_dict['name'],
-                                account_dict['token_data'],
-                                1 if account_dict.get('enabled') else 0,
-                                account_dict.get('checkin_time_start', '06:30'),
-                                account_dict.get('checkin_time_end', '06:40'),
-                                account_dict.get('check_interval', 60),
-                                account_dict.get('retry_count', 2),
-                                account_dict.get('last_checkin_date'),
-                                account_dict.get('created_at'),
-                                account_dict.get('updated_at')
-                            ))
-                    
-                    # 同步notification_settings表
-                    mysql_cursor.execute("SELECT * FROM notification_settings WHERE id = 1")
-                    settings = mysql_cursor.fetchone()
-                    
-                    if settings and mysql_cursor.description:
-                        columns = [desc[0] for desc in mysql_cursor.description]
-                        settings_dict = dict(zip(columns, settings))
-                        
-                        sqlite_cursor.execute("DELETE FROM notification_settings")
-                        sqlite_cursor.execute('''
-                            INSERT INTO notification_settings 
-                            (enabled, telegram_enabled, telegram_bot_token, telegram_user_id,
-                             telegram_custom_host, wechat_enabled, wechat_webhook_key,
-                             wxpusher_enabled, wxpusher_app_token, wxpusher_uid,
-                             dingtalk_enabled, dingtalk_access_token, dingtalk_secret)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            1 if settings_dict.get('enabled') else 0,
-                            1 if settings_dict.get('telegram_enabled') else 0,
-                            settings_dict.get('telegram_bot_token', ''),
-                            settings_dict.get('telegram_user_id', ''),
-                            settings_dict.get('telegram_custom_host', 'https://api.telegram.org'),
-                            1 if settings_dict.get('wechat_enabled') else 0,
-                            settings_dict.get('wechat_webhook_key', ''),
-                            1 if settings_dict.get('wxpusher_enabled') else 0,
-                            settings_dict.get('wxpusher_app_token', ''),
-                            settings_dict.get('wxpusher_uid', ''),
-                            1 if settings_dict.get('dingtalk_enabled') else 0,
-                            settings_dict.get('dingtalk_access_token', ''),
-                            settings_dict.get('dingtalk_secret', '')
-                        ))
-                    
-                    sqlite_conn.commit()
-                    logger.info("Data synced from MySQL to local cache")
-                    
-        except Exception as e:
-            logger.error(f"Error syncing from MySQL: {e}")
-    
-    def sync_to_mysql(self, table, data, operation='insert'):
-        """同步数据到MySQL"""
-        if not self.using_mysql:
-            return True  # 如果没有使用MySQL，直接返回成功
-        
-        try:
-            with self.get_mysql_connection() as conn:
-                cursor = conn.cursor()
-                
-                if table == 'accounts':
-                    if operation == 'insert':
-                        cursor.execute('''
-                            INSERT INTO accounts (name, token_data, enabled, checkin_time_start,
-                                                checkin_time_end, check_interval, retry_count)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ''', data)
-                    elif operation == 'update':
-                        # data应该是(updates, params)的形式
-                        query, params = data
-                        cursor.execute(query, params)
-                    elif operation == 'delete':
-                        cursor.execute('DELETE FROM accounts WHERE id = %s', data)
-                
-                elif table == 'checkin_history':
-                    if operation == 'insert':
-                        cursor.execute('''
-                            INSERT INTO checkin_history (account_id, success, message, checkin_date, retry_times)
-                            VALUES (%s, %s, %s, %s, %s)
-                        ''', data)
-                    elif operation == 'delete':
-                        query, params = data
-                        cursor.execute(query, params)
-                
-                elif table == 'notification_settings':
-                    if operation == 'update':
-                        cursor.execute('''
-                            UPDATE notification_settings
-                            SET enabled = %s, telegram_enabled = %s, telegram_bot_token = %s,
-                                telegram_user_id = %s, telegram_custom_host = %s,
-                                wechat_enabled = %s, wechat_webhook_key = %s,
-                                wxpusher_enabled = %s, wxpusher_app_token = %s, wxpusher_uid = %s,
-                                dingtalk_enabled = %s, dingtalk_access_token = %s, dingtalk_secret = %s,
-                                updated_at = %s
-                            WHERE id = 1
-                        ''', data)
-                
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error syncing to MySQL: {e}")
-            # 如果MySQL同步失败，尝试重连
-            if "Lost connection" in str(e) or "MySQL server has gone away" in str(e):
-                self.using_mysql = False
-                self.retry_count = 1
-                threading.Thread(target=self._reconnect_mysql, daemon=True).start()
-            return False
-    
-    def execute(self, query, params=None, sync_to_mysql=True):
-        """执行数据库查询（本地SQLite）"""
-        with self.lock:
-            try:
-                conn = sqlite3.connect(self.local_db_path, check_same_thread=False)
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                
-                if params:
-                    cursor.execute(query, params)
+                if self.db_type == 'mysql':
+                    count = result[0] if result else 0
                 else:
-                    cursor.execute(query)
+                    count = result['cnt'] if result else 0
                 
-                conn.commit()
+                if count == 0:
+                    if self.db_type == 'mysql':
+                        cursor.execute('''
+                            INSERT INTO notification_settings 
+                            (enabled) VALUES (FALSE)
+                        ''')
+                    else:
+                        cursor.execute('''
+                            INSERT INTO notification_settings 
+                            (enabled) VALUES (0)
+                        ''')
+                        self.conn.commit()
                 
-                # 如果是写操作且需要同步到MySQL
-                if sync_to_mysql and self.using_mysql and query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE')):
-                    self._sync_write_to_mysql(query, params)
-                
-                return cursor
+                logger.info("Database tables initialized successfully")
                 
             except Exception as e:
-                logger.error(f"Database execute error: {e}")
+                logger.error(f"Error initializing tables: {e}")
+                logger.error(traceback.format_exc())
                 raise
-            finally:
-                conn.close()
     
-    def _sync_write_to_mysql(self, query, params):
-        """将写操作同步到MySQL（异步）"""
-        def sync():
-            try:
-                # 简单的查询解析，实际应用中可能需要更复杂的处理
-                query_upper = query.strip().upper()
-                
-                if 'ACCOUNTS' in query_upper:
-                    if query_upper.startswith('INSERT'):
-                        self.sync_to_mysql('accounts', params, 'insert')
-                    elif query_upper.startswith('UPDATE'):
-                        # 转换SQL语句为MySQL格式
-                        mysql_query = query.replace('?', '%s')
-                        self.sync_to_mysql('accounts', (mysql_query, params), 'update')
-                    elif query_upper.startswith('DELETE'):
-                        self.sync_to_mysql('accounts', params, 'delete')
-                
-                elif 'CHECKIN_HISTORY' in query_upper:
-                    if query_upper.startswith('INSERT'):
-                        self.sync_to_mysql('checkin_history', params, 'insert')
-                    elif query_upper.startswith('DELETE'):
-                        mysql_query = query.replace('?', '%s')
-                        self.sync_to_mysql('checkin_history', (mysql_query, params), 'delete')
-                
-                elif 'NOTIFICATION_SETTINGS' in query_upper:
-                    if query_upper.startswith('UPDATE') or query_upper.startswith('INSERT'):
-                        self.sync_to_mysql('notification_settings', params, 'update')
-                        
-            except Exception as e:
-                logger.error(f"Error in async MySQL sync: {e}")
+    def execute(self, query, params=None, use_cache=True):
+        """Execute a database query"""
+        # 对于查询操作，优先使用缓存
+        if use_cache and query.strip().upper().startswith('SELECT'):
+            if 'accounts' in query and 'WHERE enabled = 1' in query:
+                # 返回缓存的账户数据
+                accounts = local_cache.get_accounts()
+                if accounts:
+                    return [acc for acc in accounts if acc.get('enabled')]
+            elif 'notification_settings' in query:
+                # 返回缓存的通知设置
+                settings = local_cache.get_notification_settings()
+                if settings:
+                    return settings
         
-        # 异步执行同步
-        threading.Thread(target=sync, daemon=True).start()
+        # 执行数据库操作
+        with self.lock:
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    cursor = self.conn.cursor()
+                    
+                    if self.db_type == 'mysql' and query:
+                        query = query.replace('?', '%s')
+                    
+                    if params:
+                        cursor.execute(query, params)
+                    else:
+                        cursor.execute(query)
+                    
+                    if self.db_type == 'sqlite':
+                        self.conn.commit()
+                    
+                    # 如果是修改操作，同步到缓存
+                    if not query.strip().upper().startswith('SELECT'):
+                        self.sync_from_db()
+                    
+                    return cursor
+                    
+                except Exception as e:
+                    logger.error(f"Database execute error (attempt {attempt + 1}): {e}")
+                    if 'Lost connection' in str(e) or '2013' in str(e):
+                        if attempt < max_retries - 1:
+                            self.reconnect()
+                            time.sleep(1)
+                        else:
+                            raise
+                    else:
+                        raise
     
-    def fetchone(self, query, params=None):
-        """获取单行数据（从本地缓存）"""
-        cursor = self.execute(query, params, sync_to_mysql=False)
+    def fetchone(self, query, params=None, use_cache=True):
+        """Fetch one row from database"""
+        # 优先从缓存获取
+        if use_cache:
+            if 'notification_settings' in query:
+                settings = local_cache.get_notification_settings()
+                if settings:
+                    return settings
+        
+        cursor = self.execute(query, params, use_cache=False)
         result = cursor.fetchone()
-        return dict(result) if result else None
+        
+        if result:
+            if self.db_type == 'mysql':
+                if cursor.description:
+                    columns = [desc[0] for desc in cursor.description]
+                    if isinstance(result, tuple):
+                        result = dict(zip(columns, result))
+            elif self.db_type == 'sqlite':
+                result = dict(result) if result else None
+        
+        return result
     
-    def fetchall(self, query, params=None):
-        """获取所有行（从本地缓存）"""
-        cursor = self.execute(query, params, sync_to_mysql=False)
+    def fetchall(self, query, params=None, use_cache=True):
+        """Fetch all rows from database"""
+        # 优先从缓存获取
+        if use_cache:
+            if 'accounts' in query:
+                accounts = local_cache.get_accounts()
+                if accounts:
+                    if 'WHERE enabled = 1' in query:
+                        return [acc for acc in accounts if acc.get('enabled')]
+                    return accounts
+        
+        cursor = self.execute(query, params, use_cache=False)
         results = cursor.fetchall()
-        return [dict(row) for row in results] if results else []
+        
+        if results:
+            if self.db_type == 'mysql':
+                if cursor.description:
+                    columns = [desc[0] for desc in cursor.description]
+                    results = [dict(zip(columns, row)) for row in results]
+            elif self.db_type == 'sqlite':
+                results = [dict(row) for row in results]
+        
+        return results or []
 
 # Initialize database
 try:
@@ -579,20 +597,20 @@ class NotificationService:
     def send_notification(title, content, account_name=None):
         """Send notification through configured channels"""
         try:
-            settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
+            # 从缓存获取设置
+            settings = local_cache.get_notification_settings()
             if not settings or not settings.get('enabled'):
                 logger.info("Notifications disabled")
                 return
             
             # Send Telegram notification
             if settings.get('telegram_enabled') and settings.get('telegram_bot_token') and settings.get('telegram_user_id'):
-                custom_host = settings.get('telegram_custom_host', 'https://api.telegram.org')
                 NotificationService.send_telegram(
                     settings['telegram_bot_token'],
                     settings['telegram_user_id'],
                     title,
                     content,
-                    custom_host
+                    settings.get('telegram_host', '')
                 )
             
             # Send WeChat Work notification
@@ -600,7 +618,8 @@ class NotificationService:
                 NotificationService.send_wechat(
                     settings['wechat_webhook_key'],
                     title,
-                    content
+                    content,
+                    settings.get('wechat_host', '')
                 )
             
             # Send WxPusher notification
@@ -609,7 +628,8 @@ class NotificationService:
                     settings['wxpusher_app_token'],
                     settings['wxpusher_uid'],
                     title,
-                    content
+                    content,
+                    settings.get('wxpusher_host', '')
                 )
             
             # Send DingTalk notification
@@ -618,24 +638,18 @@ class NotificationService:
                     settings['dingtalk_access_token'],
                     settings['dingtalk_secret'],
                     title,
-                    content
+                    content,
+                    settings.get('dingtalk_host', '')
                 )
                 
         except Exception as e:
             logger.error(f"Notification error: {e}")
     
     @staticmethod
-    def send_telegram(token, chat_id, title, content, custom_host=None):
-        """Send Telegram notification with configurable host"""
+    def send_telegram(token, chat_id, title, content, custom_host=''):
+        """Send Telegram notification"""
         try:
-            if custom_host:
-                host = custom_host.strip()
-                if not host.startswith(('http://', 'https://')):
-                    host = 'https://' + host
-                host = host.rstrip('/')
-            else:
-                host = "https://api.telegram.org"
-
+            host = custom_host.strip() if custom_host else "https://api.telegram.org"
             url = f"{host}/bot{token}/sendMessage"
             data = {
                 "chat_id": chat_id,
@@ -647,17 +661,18 @@ class NotificationService:
             result = response.json()
             
             if result.get("ok"):
-                logger.info(f"Telegram notification sent successfully via {host}")
+                logger.info("Telegram notification sent successfully")
             else:
                 logger.error(f"Telegram notification failed: {result.get('description')}")
         except Exception as e:
             logger.error(f"Telegram notification error: {e}")
     
     @staticmethod
-    def send_wechat(webhook_key, title, content):
+    def send_wechat(webhook_key, title, content, custom_host=''):
         """Send WeChat Work notification"""
         try:
-            url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={webhook_key}"
+            host = custom_host.strip() if custom_host else "https://qyapi.weixin.qq.com"
+            url = f"{host}/cgi-bin/webhook/send?key={webhook_key}"
             headers = {"Content-Type": "application/json;charset=utf-8"}
             data = {"msgtype": "text", "text": {"content": f"【{title}】\n\n{content}"}}
             
@@ -676,17 +691,18 @@ class NotificationService:
             logger.error(f"WeChat Work notification error: {e}")
     
     @staticmethod
-    def send_wxpusher(app_token, uid, title, content):
+    def send_wxpusher(app_token, uid, title, content, custom_host=''):
         """Send WxPusher notification"""
         try:
-            url = "https://wxpusher.zjiecode.com/api/send/message"
+            host = custom_host.strip() if custom_host else "https://wxpusher.zjiecode.com"
+            url = f"{host}/api/send/message"
             
-            # 修复深色模式下的显示问题
+            # 格式化HTML内容 - 修复深色模式问题
             html_content = f"""
-            <div style="padding: 10px; background-color: #ffffff; color: #2c3e50;">
-                <h2 style="color: #2c3e50; margin: 0;">{title}</h2>
-                <div style="margin-top: 10px; padding: 10px; background-color: #f8f9fa; border-radius: 5px;">
-                    <pre style="white-space: pre-wrap; word-wrap: break-word; margin: 0; color: #2c3e50; font-family: inherit;">{content}</pre>
+            <div style="padding: 10px; color: #2c3e50; background: #ffffff;">
+                <h2 style="color: inherit; margin: 0;">{title}</h2>
+                <div style="margin-top: 10px; padding: 10px; background: #f8f9fa; border-radius: 5px; color: #2c3e50;">
+                    <pre style="white-space: pre-wrap; word-wrap: break-word; margin: 0; color: inherit;">{content}</pre>
                 </div>
                 <div style="margin-top: 10px; color: #7f8c8d; font-size: 12px;">
                     发送时间: {datetime.now(TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')}
@@ -714,9 +730,10 @@ class NotificationService:
             logger.error(f"WxPusher notification error: {e}")
     
     @staticmethod
-    def send_dingtalk(access_token, secret, title, content):
+    def send_dingtalk(access_token, secret, title, content, custom_host=''):
         """Send DingTalk robot notification"""
         try:
+            # 生成签名
             timestamp = str(round(time.time() * 1000))
             string_to_sign = f'{timestamp}\n{secret}'
             hmac_code = hmac.new(
@@ -726,8 +743,11 @@ class NotificationService:
             ).digest()
             sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
             
-            url = f'https://oapi.dingtalk.com/robot/send?access_token={access_token}&timestamp={timestamp}&sign={sign}'
+            # 构建URL
+            host = custom_host.strip() if custom_host else "https://oapi.dingtalk.com"
+            url = f'{host}/robot/send?access_token={access_token}&timestamp={timestamp}&sign={sign}'
             
+            # 构建消息体
             data = {
                 "msgtype": "text",
                 "text": {
@@ -749,7 +769,7 @@ class NotificationService:
         except Exception as e:
             logger.error(f"DingTalk notification error: {e}")
 
-# Leaflow check-in class
+# Leaflow check-in class (保持不变)
 class LeafLowCheckin:
     def __init__(self):
         self.checkin_url = "https://checkin.leaflow.net"
@@ -813,6 +833,7 @@ class LeafLowCheckin:
         logger.info(f"🎯 [{account_name}] Performing checkin...")
         
         try:
+            # Try direct check-in page
             response = session.get(self.checkin_url, timeout=30)
             
             if response.status_code == 200:
@@ -820,6 +841,7 @@ class LeafLowCheckin:
                 if result[0]:
                     return result
             
+            # Try API endpoints
             api_endpoints = [
                 f"{self.checkin_url}/api/checkin",
                 f"{self.checkin_url}/checkin",
@@ -829,12 +851,14 @@ class LeafLowCheckin:
             
             for endpoint in api_endpoints:
                 try:
+                    # GET request
                     response = session.get(endpoint, timeout=30)
                     if response.status_code == 200:
                         success, message = self.check_checkin_response(response.text)
                         if success:
                             return True, message
                     
+                    # POST request
                     response = session.post(endpoint, data={'checkin': '1'}, timeout=30)
                     if response.status_code == 200:
                         success, message = self.check_checkin_response(response.text)
@@ -938,6 +962,7 @@ def parse_cookie_string(cookie_input):
     """Parse cookie string in various formats"""
     cookie_input = cookie_input.strip()
     
+    # Try to parse as JSON first
     if cookie_input.startswith('{'):
         try:
             data = json.loads(cookie_input)
@@ -948,6 +973,7 @@ def parse_cookie_string(cookie_input):
         except json.JSONDecodeError:
             pass
     
+    # Parse as semicolon-separated cookie string
     cookies = {}
     cookie_pairs = re.split(r';\s*', cookie_input)
     
@@ -1016,15 +1042,25 @@ class CheckinScheduler:
         """调度器主循环"""
         while self.running:
             try:
+                # 获取当前北京时间
                 now = datetime.now(TIMEZONE)
                 current_date = now.date()
                 
-                accounts = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
+                # 从缓存获取账户
+                accounts = local_cache.get_accounts()
+                if not accounts:
+                    # 缓存为空，从数据库同步
+                    db.sync_from_db()
+                    accounts = local_cache.get_accounts()
                 
                 for account in accounts:
                     try:
+                        if not account.get('enabled'):
+                            continue
+                        
                         account_id = account['id']
                         
+                        # 检查今天是否已经签到
                         last_checkin_date = account.get('last_checkin_date')
                         if last_checkin_date:
                             if isinstance(last_checkin_date, str):
@@ -1032,17 +1068,22 @@ class CheckinScheduler:
                             if last_checkin_date == current_date:
                                 continue
                         
+                        # 获取签到时间范围
                         start_time_str = account.get('checkin_time_start', '06:30')
                         end_time_str = account.get('checkin_time_end', '06:40')
                         check_interval = account.get('check_interval', 60)
                         
+                        # 解析时间
                         start_hour, start_minute = map(int, start_time_str.split(':'))
                         end_hour, end_minute = map(int, end_time_str.split(':'))
                         
+                        # 创建今天的开始和结束时间
                         start_time = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
                         end_time = now.replace(hour=end_hour, minute=end_minute, second=59, microsecond=999999)
                         
+                        # 检查是否在签到时间范围内
                         if start_time <= now <= end_time:
+                            # 检查是否需要执行签到
                             task_key = f"{account_id}_{current_date}"
                             
                             if task_key not in self.checkin_tasks:
@@ -1054,9 +1095,11 @@ class CheckinScheduler:
                             
                             task = self.checkin_tasks[task_key]
                             
+                            # 如果还没完成签到，且距离上次检查超过了间隔时间
                             if not task['completed']:
                                 if task['last_check'] is None or \
                                    (now - task['last_check']).total_seconds() >= check_interval:
+                                    # 执行签到
                                     task['last_check'] = now
                                     threading.Thread(
                                         target=self.perform_checkin_with_delay,
@@ -1067,6 +1110,7 @@ class CheckinScheduler:
                         logger.error(f"Error processing account {account.get('id', 'unknown')}: {e}")
                         continue
                 
+                # 清理过期的任务记录
                 expired_keys = []
                 for key in self.checkin_tasks:
                     if not key.endswith(str(current_date)):
@@ -1078,16 +1122,20 @@ class CheckinScheduler:
                 logger.error(f"Scheduler error: {e}")
                 logger.error(traceback.format_exc())
             
+            # 等待一段时间再检查
             time.sleep(30)
     
     def perform_checkin_with_delay(self, account_id, task_key):
         """带随机延迟的签到执行"""
         try:
+            # 添加随机延迟（0-30秒）
             delay = random.randint(0, 30)
             time.sleep(delay)
             
+            # 执行签到
             success = self.perform_checkin(account_id)
             
+            # 标记任务完成
             if task_key in self.checkin_tasks:
                 self.checkin_tasks[task_key]['completed'] = success
                 
@@ -1098,51 +1146,80 @@ class CheckinScheduler:
     def perform_checkin(self, account_id, retry_attempt=0):
         """Perform check-in for an account with retry mechanism"""
         try:
-            account = db.fetchone('SELECT * FROM accounts WHERE id = ?', (account_id,))
+            # 从缓存获取账户信息
+            accounts = local_cache.get_accounts()
+            account = None
+            for acc in accounts:
+                if acc['id'] == account_id:
+                    account = acc
+                    break
+            
             if not account or not account.get('enabled'):
                 return False
             
+            # 获取当前北京时间日期
             current_date = datetime.now(TIMEZONE).date()
             
+            # 检查今天是否已经签到
             existing_checkin = db.fetchone('''
                 SELECT id FROM checkin_history 
                 WHERE account_id = ? AND checkin_date = ?
-            ''', (account_id, current_date))
+            ''', (account_id, current_date), use_cache=False)
             
             if existing_checkin:
                 logger.info(f"Account {account['name']} already checked in today")
                 return True
             
+            # Parse token data
             token_data = json.loads(account['token_data'])
             
+            # Create session and perform check-in
             session = self.leaflow_checkin.create_session(token_data)
             
+            # Test authentication
             auth_result = self.leaflow_checkin.test_authentication(session, account['name'])
             if not auth_result[0]:
                 success = False
                 message = f"Authentication failed: {auth_result[1]}"
             else:
+                # Perform check-in
                 success, message = self.leaflow_checkin.perform_checkin(session, account['name'])
             
+            # 如果失败且还有重试次数
             retry_count = account.get('retry_count', 2)
             if not success and retry_attempt < retry_count:
                 logger.info(f"Retrying checkin for {account['name']} (attempt {retry_attempt + 1}/{retry_count})")
                 time.sleep(5)
                 return self.perform_checkin(account_id, retry_attempt + 1)
             
+            # Record check-in result
             db.execute('''
                 INSERT INTO checkin_history (account_id, success, message, checkin_date, retry_times)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (account_id, success, message, current_date, retry_attempt))
+            ''', (account_id, success, message, current_date, retry_attempt), use_cache=False)
             
+            # 更新最后签到日期
             if success:
                 db.execute('''
                     UPDATE accounts SET last_checkin_date = ?
                     WHERE id = ?
-                ''', (current_date, account_id))
+                ''', (current_date, account_id), use_cache=False)
+                # 同步缓存
+                db.sync_from_db()
+            
+            # 添加到本地缓存历史
+            local_cache.add_checkin_history({
+                'account_id': account_id,
+                'account_name': account['name'],
+                'success': success,
+                'message': message,
+                'retry_times': retry_attempt,
+                'created_at': datetime.now(TIMEZONE).isoformat()
+            })
             
             logger.info(f"Check-in for {account['name']}: {'Success' if success else 'Failed'} - {message}")
             
+            # Send notification
             notification_title = f"Leaflow签到结果 - {account['name']}"
             status_emoji = '✅' if success else '❌'
             notification_content = f"状态: {status_emoji} {'成功' if success else '失败'}\n消息: {message}\n重试次数: {retry_attempt}"
@@ -1154,8 +1231,14 @@ class CheckinScheduler:
             logger.error(f"Check-in error for account {account_id}: {e}")
             logger.error(traceback.format_exc())
             
+            # Send error notification
             try:
-                account = db.fetchone('SELECT name FROM accounts WHERE id = ?', (account_id,))
+                accounts = local_cache.get_accounts()
+                account = None
+                for acc in accounts:
+                    if acc['id'] == account_id:
+                        account = acc
+                        break
                 if account:
                     NotificationService.send_notification(
                         f"Leaflow签到错误 - {account['name']}",
@@ -1172,16 +1255,14 @@ scheduler = CheckinScheduler()
 # Routes
 @app.route('/')
 def index():
-    """Check authentication and redirect accordingly"""
+    """Serve the main HTML page or redirect to dashboard"""
     token = request.cookies.get('auth_token')
-    
     if token:
         try:
             jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
             return render_template_string(HTML_TEMPLATE, authenticated=True)
         except:
             pass
-    
     return render_template_string(HTML_TEMPLATE, authenticated=False)
 
 @app.route('/api/login', methods=['POST', 'OPTIONS'])
@@ -1213,7 +1294,7 @@ def login():
             logger.info(f"Login successful for user: {username}")
             
             response = jsonify({'token': token, 'message': 'Login successful'})
-            response.set_cookie('auth_token', token, max_age=7*24*60*60, httponly=True, samesite='Lax')
+            response.set_cookie('auth_token', token, max_age=7*24*60*60, httponly=True)
             return response
         
         logger.warning(f"Login failed for user: {username}")
@@ -1235,11 +1316,15 @@ def logout():
 def dashboard():
     """Get dashboard statistics"""
     try:
-        total_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts')
-        enabled_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts WHERE enabled = 1')
+        # 从缓存获取账户数据
+        accounts = local_cache.get_accounts()
+        total_accounts = len(accounts)
+        enabled_accounts = len([acc for acc in accounts if acc.get('enabled')])
         
+        # 获取今天的日期（北京时间）
         today = datetime.now(TIMEZONE).date()
         
+        # 获取今日签到记录
         today_checkins = db.fetchall('''
             SELECT a.name, ch.success, ch.message, ch.created_at, ch.retry_times
             FROM checkin_history ch
@@ -1247,18 +1332,18 @@ def dashboard():
             WHERE DATE(ch.checkin_date) = DATE(?)
             ORDER BY ch.created_at DESC
             LIMIT 20
-        ''', (today,))
+        ''', (today,), use_cache=False)
         
-        total_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history')
-        successful_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history WHERE success = 1')
+        total_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history', use_cache=False)
+        successful_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history WHERE success = 1', use_cache=False)
         
         total_count = total_checkins['count'] if total_checkins else 0
         success_count = successful_checkins['count'] if successful_checkins else 0
         success_rate = round(success_count / total_count * 100, 2) if total_count > 0 else 0
         
         return jsonify({
-            'total_accounts': total_accounts['count'] if total_accounts else 0,
-            'enabled_accounts': enabled_accounts['count'] if enabled_accounts else 0,
+            'total_accounts': total_accounts,
+            'enabled_accounts': enabled_accounts,
             'today_checkins': today_checkins or [],
             'total_checkins': total_count,
             'successful_checkins': success_count,
@@ -1274,12 +1359,23 @@ def dashboard():
 def get_accounts():
     """Get all accounts"""
     try:
-        accounts = db.fetchall('''
-            SELECT id, name, enabled, checkin_time_start, checkin_time_end, 
-                   check_interval, retry_count, created_at 
-            FROM accounts
-        ''')
-        return jsonify(accounts or [])
+        # 从缓存获取账户
+        accounts = local_cache.get_accounts()
+        # 过滤敏感信息
+        safe_accounts = []
+        for acc in accounts:
+            safe_acc = {
+                'id': acc['id'],
+                'name': acc['name'],
+                'enabled': acc.get('enabled', True),
+                'checkin_time_start': acc.get('checkin_time_start', '06:30'),
+                'checkin_time_end': acc.get('checkin_time_end', '06:40'),
+                'check_interval': acc.get('check_interval', 60),
+                'retry_count': acc.get('retry_count', 2),
+                'created_at': acc.get('created_at')
+            }
+            safe_accounts.append(safe_acc)
+        return jsonify(safe_accounts)
     except Exception as e:
         logger.error(f"Get accounts error: {e}")
         return jsonify({'error': 'Failed to load accounts'}), 500
@@ -1300,17 +1396,22 @@ def add_account():
         if not name or not cookie_input:
             return jsonify({'message': 'Name and cookie data are required'}), 400
         
+        # Parse cookie input
         if isinstance(cookie_input, str):
             token_data = parse_cookie_string(cookie_input)
         else:
             token_data = cookie_input
         
+        # 添加到数据库
         db.execute('''
             INSERT INTO accounts (name, token_data, checkin_time_start, checkin_time_end, check_interval, retry_count)
             VALUES (?, ?, ?, ?, ?, ?)
-        ''', (name, json.dumps(token_data), checkin_time_start, checkin_time_end, check_interval, retry_count))
+        ''', (name, json.dumps(token_data), checkin_time_start, checkin_time_end, check_interval, retry_count), use_cache=False)
         
-        logger.info(f"Account '{name}' added")
+        # 同步缓存
+        db.sync_from_db()
+        
+        logger.info(f"Account '{name}' added and cache synced")
         
         return jsonify({'message': 'Account added successfully'})
         
@@ -1362,9 +1463,12 @@ def update_account(account_id):
         if updates:
             params.append(account_id)
             query = f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?"
-            db.execute(query, params)
+            db.execute(query, params, use_cache=False)
             
-            logger.info(f"Account {account_id} updated")
+            # 同步缓存
+            db.sync_from_db()
+            
+            logger.info(f"Account {account_id} updated and cache synced")
             
             return jsonify({'message': 'Account updated successfully'})
         
@@ -1379,10 +1483,13 @@ def update_account(account_id):
 def delete_account(account_id):
     """Delete an account"""
     try:
-        db.execute('DELETE FROM checkin_history WHERE account_id = ?', (account_id,))
-        db.execute('DELETE FROM accounts WHERE id = ?', (account_id,))
+        db.execute('DELETE FROM checkin_history WHERE account_id = ?', (account_id,), use_cache=False)
+        db.execute('DELETE FROM accounts WHERE id = ?', (account_id,), use_cache=False)
         
-        logger.info(f"Account {account_id} deleted")
+        # 同步缓存
+        db.sync_from_db()
+        
+        logger.info(f"Account {account_id} deleted and cache synced")
         
         return jsonify({'message': 'Account deleted successfully'})
     except Exception as e:
@@ -1398,18 +1505,24 @@ def clear_checkin_history():
         clear_type = data.get('type', 'today')
         
         if clear_type == 'today':
+            # 清空今日签到记录
             today = datetime.now(TIMEZONE).date()
-            db.execute('DELETE FROM checkin_history WHERE DATE(checkin_date) = DATE(?)', (today,))
-            db.execute('UPDATE accounts SET last_checkin_date = NULL WHERE DATE(last_checkin_date) = DATE(?)', (today,))
+            db.execute('DELETE FROM checkin_history WHERE DATE(checkin_date) = DATE(?)', (today,), use_cache=False)
+            # 重置今日的最后签到日期
+            db.execute('UPDATE accounts SET last_checkin_date = NULL WHERE DATE(last_checkin_date) = DATE(?)', (today,), use_cache=False)
             message = 'Today\'s checkin history cleared'
         elif clear_type == 'all':
-            db.execute('DELETE FROM checkin_history')
-            db.execute('UPDATE accounts SET last_checkin_date = NULL')
+            # 清空所有签到记录
+            db.execute('DELETE FROM checkin_history', use_cache=False)
+            db.execute('UPDATE accounts SET last_checkin_date = NULL', use_cache=False)
             message = 'All checkin history cleared'
         else:
             return jsonify({'message': 'Invalid clear type'}), 400
         
-        logger.info(f"Checkin history cleared ({clear_type})")
+        # 同步缓存
+        db.sync_from_db()
+        
+        logger.info(f"Checkin history cleared ({clear_type}) and cache synced")
         
         return jsonify({'message': message})
     except Exception as e:
@@ -1421,22 +1534,23 @@ def clear_checkin_history():
 def get_notification_settings():
     """Get notification settings"""
     try:
-        settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
+        # 从缓存获取通知设置
+        settings = local_cache.get_notification_settings()
         if settings:
+            # 转换布尔值
             for key in ['enabled', 'telegram_enabled', 'wechat_enabled', 'wxpusher_enabled', 'dingtalk_enabled']:
                 if key in settings:
                     settings[key] = bool(settings.get(key, 0))
             
+            # 确保字符串字段不为None
             string_fields = [
-                'telegram_bot_token', 'telegram_user_id', 'telegram_custom_host',
-                'wechat_webhook_key', 'wxpusher_app_token', 'wxpusher_uid',
-                'dingtalk_access_token', 'dingtalk_secret'
+                'telegram_bot_token', 'telegram_user_id', 'telegram_host',
+                'wechat_webhook_key', 'wechat_host',
+                'wxpusher_app_token', 'wxpusher_uid', 'wxpusher_host',
+                'dingtalk_access_token', 'dingtalk_secret', 'dingtalk_host'
             ]
             for field in string_fields:
                 settings[field] = settings.get(field, '') or ''
-
-            if not settings.get('telegram_custom_host'):
-                settings['telegram_custom_host'] = 'https://api.telegram.org'
             
             return jsonify(settings)
         else:
@@ -1446,15 +1560,18 @@ def get_notification_settings():
                 'telegram_enabled': False,
                 'telegram_bot_token': '',
                 'telegram_user_id': '',
-                'telegram_custom_host': 'https://api.telegram.org',
+                'telegram_host': '',
                 'wechat_enabled': False,
                 'wechat_webhook_key': '',
+                'wechat_host': '',
                 'wxpusher_enabled': False,
                 'wxpusher_app_token': '',
                 'wxpusher_uid': '',
+                'wxpusher_host': '',
                 'dingtalk_enabled': False,
                 'dingtalk_access_token': '',
-                'dingtalk_secret': ''
+                'dingtalk_secret': '',
+                'dingtalk_host': ''
             }
             return jsonify(default_settings)
     except Exception as e:
@@ -1469,58 +1586,61 @@ def update_notification_settings():
         data = request.get_json()
         logger.info(f"Updating notification settings with data: {data}")
         
+        # 准备更新数据
         enabled = 1 if data.get('enabled', False) else 0
         telegram_enabled = 1 if data.get('telegram_enabled', False) else 0
         telegram_bot_token = data.get('telegram_bot_token', '') or ''
         telegram_user_id = data.get('telegram_user_id', '') or ''
-        telegram_custom_host = data.get('telegram_custom_host', 'https://api.telegram.org') or 'https://api.telegram.org'
-
-        if telegram_custom_host and telegram_custom_host.strip():
-            telegram_custom_host = telegram_custom_host.strip()
-            if not telegram_custom_host.startswith(('http://', 'https://')):
-                telegram_custom_host = 'https://' + telegram_custom_host
-            telegram_custom_host = telegram_custom_host.rstrip('/')
-
+        telegram_host = data.get('telegram_host', '') or ''
         wechat_enabled = 1 if data.get('wechat_enabled', False) else 0
         wechat_webhook_key = data.get('wechat_webhook_key', '') or ''
+        wechat_host = data.get('wechat_host', '') or ''
         wxpusher_enabled = 1 if data.get('wxpusher_enabled', False) else 0
         wxpusher_app_token = data.get('wxpusher_app_token', '') or ''
         wxpusher_uid = data.get('wxpusher_uid', '') or ''
+        wxpusher_host = data.get('wxpusher_host', '') or ''
         dingtalk_enabled = 1 if data.get('dingtalk_enabled', False) else 0
         dingtalk_access_token = data.get('dingtalk_access_token', '') or ''
         dingtalk_secret = data.get('dingtalk_secret', '') or ''
+        dingtalk_host = data.get('dingtalk_host', '') or ''
         
-        existing = db.fetchone('SELECT id FROM notification_settings WHERE id = 1')
+        existing = db.fetchone('SELECT id FROM notification_settings WHERE id = 1', use_cache=False)
         
         if existing:
             db.execute('''
                 UPDATE notification_settings
-                SET enabled = ?, telegram_enabled = ?, telegram_bot_token = ?, telegram_user_id = ?,
-                    telegram_custom_host = ?, wechat_enabled = ?, wechat_webhook_key = ?, wxpusher_enabled = ?,
-                    wxpusher_app_token = ?, wxpusher_uid = ?, dingtalk_enabled = ?,
-                    dingtalk_access_token = ?, dingtalk_secret = ?, updated_at = ?
+                SET enabled = ?, telegram_enabled = ?, telegram_bot_token = ?, telegram_user_id = ?, telegram_host = ?,
+                    wechat_enabled = ?, wechat_webhook_key = ?, wechat_host = ?,
+                    wxpusher_enabled = ?, wxpusher_app_token = ?, wxpusher_uid = ?, wxpusher_host = ?,
+                    dingtalk_enabled = ?, dingtalk_access_token = ?, dingtalk_secret = ?, dingtalk_host = ?,
+                    updated_at = ?
                 WHERE id = 1
             ''', (
-                enabled, telegram_enabled, telegram_bot_token, telegram_user_id,
-                telegram_custom_host, wechat_enabled, wechat_webhook_key, wxpusher_enabled,
-                wxpusher_app_token, wxpusher_uid, dingtalk_enabled,
-                dingtalk_access_token, dingtalk_secret, datetime.now()
-            ))
+                enabled, telegram_enabled, telegram_bot_token, telegram_user_id, telegram_host,
+                wechat_enabled, wechat_webhook_key, wechat_host,
+                wxpusher_enabled, wxpusher_app_token, wxpusher_uid, wxpusher_host,
+                dingtalk_enabled, dingtalk_access_token, dingtalk_secret, dingtalk_host,
+                datetime.now()
+            ), use_cache=False)
+            logger.info("Notification settings updated successfully")
         else:
             db.execute('''
-                INSERT INTO notification_settings
-                (enabled, telegram_enabled, telegram_bot_token, telegram_user_id,
-                 telegram_custom_host, wechat_enabled, wechat_webhook_key, wxpusher_enabled, wxpusher_app_token,
-                 wxpusher_uid, dingtalk_enabled, dingtalk_access_token, dingtalk_secret)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO notification_settings 
+                (id, enabled, telegram_enabled, telegram_bot_token, telegram_user_id, telegram_host,
+                 wechat_enabled, wechat_webhook_key, wechat_host,
+                 wxpusher_enabled, wxpusher_app_token, wxpusher_uid, wxpusher_host,
+                 dingtalk_enabled, dingtalk_access_token, dingtalk_secret, dingtalk_host)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                enabled, telegram_enabled, telegram_bot_token, telegram_user_id,
-                telegram_custom_host, wechat_enabled, wechat_webhook_key, wxpusher_enabled,
-                wxpusher_app_token, wxpusher_uid, dingtalk_enabled,
-                dingtalk_access_token, dingtalk_secret
-            ))
+                enabled, telegram_enabled, telegram_bot_token, telegram_user_id, telegram_host,
+                wechat_enabled, wechat_webhook_key, wechat_host,
+                wxpusher_enabled, wxpusher_app_token, wxpusher_uid, wxpusher_host,
+                dingtalk_enabled, dingtalk_access_token, dingtalk_secret, dingtalk_host
+            ), use_cache=False)
+            logger.info("Notification settings created successfully")
         
-        logger.info("Notification settings updated successfully")
+        # 同步缓存
+        db.sync_from_db()
         
         return jsonify({'message': 'Notification settings updated successfully'})
     except Exception as e:
@@ -1553,7 +1673,7 @@ def test_notification():
         logger.error(f"Test notification error: {e}")
         return jsonify({'message': f'Error: {str(e)}'}), 400
 
-# HTML Template
+# HTML Template (修改后的版本，修复登录界面问题并添加自定义API地址输入框)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -2209,11 +2329,9 @@ HTML_TEMPLATE = '''
                         <input type="text" id="tgUserId" placeholder="接收通知的用户ID">
                     </div>
                     <div class="form-group">
-                        <label>自定义 Host (可选)</label>
-                        <input type="text" id="tgCustomHost" placeholder="https://api.telegram.org (默认)">
-                        <small style="color: #666; font-size: 12px; display: block; margin-top: 4px;">
-                            支持代理服务器，留空使用默认。没有协议前缀会自动补全 https://
-                        </small>
+                        <label>自定义API地址（可选）</label>
+                        <input type="text" id="telegramHost" placeholder="https://api.telegram.org">
+                        <div class="format-hint">留空使用默认地址</div>
                     </div>
                 </div>
                 
@@ -2227,6 +2345,11 @@ HTML_TEMPLATE = '''
                     <div class="form-group">
                         <label>Webhook Key</label>
                         <input type="text" id="wechatKey" placeholder="企业微信机器人的 Webhook Key">
+                    </div>
+                    <div class="form-group">
+                        <label>自定义API地址（可选）</label>
+                        <input type="text" id="wechatHost" placeholder="https://qyapi.weixin.qq.com">
+                        <div class="format-hint">留空使用默认地址</div>
                     </div>
                 </div>
                 
@@ -2250,6 +2373,11 @@ HTML_TEMPLATE = '''
                         <label>UID</label>
                         <input type="text" id="wxpusherUid" placeholder="UID_xxx">
                     </div>
+                    <div class="form-group">
+                        <label>自定义API地址（可选）</label>
+                        <input type="text" id="wxpusherHost" placeholder="https://wxpusher.zjiecode.com">
+                        <div class="format-hint">留空使用默认地址</div>
+                    </div>
                 </div>
                 
                 <!-- 钉钉机器人通知设置 -->
@@ -2271,6 +2399,11 @@ HTML_TEMPLATE = '''
                     <div class="form-group">
                         <label>加签密钥</label>
                         <input type="text" id="dingtalkSecret" placeholder="安全设置中的加签密钥">
+                    </div>
+                    <div class="form-group">
+                        <label>自定义API地址（可选）</label>
+                        <input type="text" id="dingtalkHost" placeholder="https://oapi.dingtalk.com">
+                        <div class="format-hint">留空使用默认地址</div>
                     </div>
                 </div>
                 
@@ -2427,11 +2560,11 @@ HTML_TEMPLATE = '''
         // 监听回车键
         document.addEventListener('DOMContentLoaded', function() {
             // 如果已经认证，直接加载数据
-            if (document.getElementById('dashboard').style.display === 'block') {
-                loadDashboard();
-                loadAccounts();
-                loadNotificationSettings();
-            }
+            {% if authenticated %}
+            loadDashboard();
+            loadAccounts();
+            loadNotificationSettings();
+            {% endif %}
             
             document.getElementById('username')?.addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
@@ -2447,26 +2580,34 @@ HTML_TEMPLATE = '''
         });
 
         function logout() {
-            fetch('/api/logout', { method: 'POST' })
-                .then(() => {
-                    location.reload();
-                });
+            fetch('/api/logout', {
+                method: 'POST',
+                credentials: 'include'
+            }).then(() => {
+                authToken = null;
+                location.reload();
+            });
         }
 
         async function apiCall(url, options = {}) {
             try {
+                const headers = {
+                    'Content-Type': 'application/json',
+                    ...options.headers
+                };
+                
+                if (authToken) {
+                    headers['Authorization'] = 'Bearer ' + authToken;
+                }
+                
                 const response = await fetch(url, {
                     ...options,
-                    headers: {
-                        'Authorization': authToken ? 'Bearer ' + authToken : '',
-                        'Content-Type': 'application/json',
-                        ...options.headers
-                    },
+                    headers,
                     credentials: 'include'
                 });
 
                 if (response.status === 401) {
-                    location.reload();
+                    logout();
                     return;
                 }
 
@@ -2582,19 +2723,31 @@ HTML_TEMPLATE = '''
                 const settings = await apiCall('/api/notification');
                 if (!settings) return;
 
+                // 主开关
                 document.getElementById('notifyEnabled').checked = settings.enabled === true || settings.enabled === 1;
+                
+                // Telegram设置
                 document.getElementById('telegramEnabled').checked = settings.telegram_enabled === true || settings.telegram_enabled === 1;
                 document.getElementById('tgBotToken').value = settings.telegram_bot_token || '';
                 document.getElementById('tgUserId').value = settings.telegram_user_id || '';
-                document.getElementById('tgCustomHost').value = settings.telegram_custom_host || 'https://api.telegram.org';
+                document.getElementById('telegramHost').value = settings.telegram_host || '';
+                
+                // 企业微信设置
                 document.getElementById('wechatEnabled').checked = settings.wechat_enabled === true || settings.wechat_enabled === 1;
                 document.getElementById('wechatKey').value = settings.wechat_webhook_key || '';
+                document.getElementById('wechatHost').value = settings.wechat_host || '';
+                
+                // WxPusher设置
                 document.getElementById('wxpusherEnabled').checked = settings.wxpusher_enabled === true || settings.wxpusher_enabled === 1;
                 document.getElementById('wxpusherAppToken').value = settings.wxpusher_app_token || '';
                 document.getElementById('wxpusherUid').value = settings.wxpusher_uid || '';
+                document.getElementById('wxpusherHost').value = settings.wxpusher_host || '';
+                
+                // 钉钉设置
                 document.getElementById('dingtalkEnabled').checked = settings.dingtalk_enabled === true || settings.dingtalk_enabled === 1;
                 document.getElementById('dingtalkAccessToken').value = settings.dingtalk_access_token || '';
                 document.getElementById('dingtalkSecret').value = settings.dingtalk_secret || '';
+                document.getElementById('dingtalkHost').value = settings.dingtalk_host || '';
             } catch (error) {
                 console.error('Failed to load notification settings:', error);
             }
@@ -2670,6 +2823,7 @@ HTML_TEMPLATE = '''
                     await apiCall(`/api/accounts/${id}`, { method: 'DELETE' });
                     showToast('账号删除成功', 'success');
                     loadAccounts();
+                    loadDashboard();
                 } catch (error) {
                     showToast('操作失败', 'error');
                 }
@@ -2699,15 +2853,18 @@ HTML_TEMPLATE = '''
                     telegram_enabled: document.getElementById('telegramEnabled').checked,
                     telegram_bot_token: document.getElementById('tgBotToken').value,
                     telegram_user_id: document.getElementById('tgUserId').value,
-                    telegram_custom_host: document.getElementById('tgCustomHost').value.trim(),
+                    telegram_host: document.getElementById('telegramHost').value,
                     wechat_enabled: document.getElementById('wechatEnabled').checked,
                     wechat_webhook_key: document.getElementById('wechatKey').value,
+                    wechat_host: document.getElementById('wechatHost').value,
                     wxpusher_enabled: document.getElementById('wxpusherEnabled').checked,
                     wxpusher_app_token: document.getElementById('wxpusherAppToken').value,
                     wxpusher_uid: document.getElementById('wxpusherUid').value,
+                    wxpusher_host: document.getElementById('wxpusherHost').value,
                     dingtalk_enabled: document.getElementById('dingtalkEnabled').checked,
                     dingtalk_access_token: document.getElementById('dingtalkAccessToken').value,
-                    dingtalk_secret: document.getElementById('dingtalkSecret').value
+                    dingtalk_secret: document.getElementById('dingtalkSecret').value,
+                    dingtalk_host: document.getElementById('dingtalkHost').value
                 };
 
                 await apiCall('/api/notification', {
@@ -2780,6 +2937,7 @@ HTML_TEMPLATE = '''
                 showToast('账号添加成功', 'success');
                 closeModal('addAccountModal');
                 loadAccounts();
+                loadDashboard();
             } catch (error) {
                 showToast('格式无效: ' + error.message, 'error');
             }
@@ -2808,6 +2966,7 @@ HTML_TEMPLATE = '''
             }
         }
 
+        // Close modal when clicking outside
         window.onclick = function(event) {
             const modals = ['addAccountModal', 'editAccountModal'];
             modals.forEach(modalId => {
@@ -2829,13 +2988,14 @@ if __name__ == '__main__':
         
         # Log startup information
         logger.info(f"Starting Leaflow Control Panel on port {PORT}")
-        logger.info(f"Database type: {DB_TYPE if db.using_mysql else 'SQLite (cache)'}")
+        logger.info(f"Database type: {DB_TYPE if db else 'Unknown'}")
         if DB_TYPE == 'mysql':
             logger.info(f"MySQL connection: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER}")
             logger.info(f"Max retry attempts: {MAX_RETRY_ATTEMPTS}")
         logger.info(f"Admin username: {ADMIN_USERNAME}")
         logger.info(f"Access the panel at: http://localhost:{PORT}")
         logger.info(f"Timezone: Asia/Shanghai (UTC+8)")
+        logger.info(f"Local cache enabled for better performance")
         
         # Start Flask app
         app.run(host='0.0.0.0', port=PORT, debug=False)
